@@ -1,0 +1,10 @@
+[package]
+name = "veya-storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "SQLite persistence for Veya flow records"
+
+[dependencies]
+veya-core = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,0 +1,16 @@
+[package]
+name = "veya-desktop"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Veya desktop UI (Iced) — Search + History + Flow"
+
+[[bin]]
+name = "veya"
+path = "src/main.rs"
+
+[dependencies]
+veya-core = { workspace = true }
+veya-windows = { workspace = true }
+veya-storage = { workspace = true }
+iced = { version = "0.13", features = ["tokio"] }

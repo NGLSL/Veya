@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "veya-core",
+    "veya-windows",
+    "veya-storage",
+    "veya-desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+veya-core = { path = "veya-core" }
+veya-windows = { path = "veya-windows" }
+veya-storage = { path = "veya-storage" }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev]
+opt-level = 1

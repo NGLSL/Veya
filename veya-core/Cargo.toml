@@ -1,0 +1,8 @@
+[package]
+name = "veya-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Veya Clipboard Flow Tracker domain core"
+
+[dependencies]

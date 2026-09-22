@@ -1,0 +1,12 @@
+[package]
+name = "veya-windows"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Win32 capture layer for Veya (clipboard, keyboard, process/window)"
+
+[dependencies]
+veya-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
