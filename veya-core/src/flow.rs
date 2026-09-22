@@ -102,6 +102,7 @@ impl FlowEngine {
             target_pid: ev.target_pid,
             target_window: ev.target_window,
             method: ev.method,
+            confidence: crate::events::PasteConfidence::HotkeyObserved,
             triggered_at_ms: ev.timestamp_ms,
         });
         FlowOutcome::PasteAttached { sequence: seq }

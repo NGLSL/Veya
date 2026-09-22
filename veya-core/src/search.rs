@@ -15,47 +15,46 @@ pub enum MatchField {
     TargetApp,
 }
 
+/// Which field matched a non-empty query. UI and `search` share this.
+pub fn match_field<'a>(
+    content: &str,
+    source_app: &str,
+    target_apps: impl Iterator<Item = &'a str>,
+    query: &str,
+) -> Option<MatchField> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Some(MatchField::Content);
+    }
+    if content.to_lowercase().contains(&q) {
+        return Some(MatchField::Content);
+    }
+    if source_app.to_lowercase().contains(&q) {
+        return Some(MatchField::SourceApp);
+    }
+    if target_apps.into_iter().any(|t| t.to_lowercase().contains(&q)) {
+        return Some(MatchField::TargetApp);
+    }
+    None
+}
+
 /// Case-insensitive substring search across text, source app, and Used-in targets.
 pub fn search<'a>(
     records: impl Iterator<Item = &'a ClipboardRecord>,
     query: &str,
 ) -> Vec<SearchHit<'a>> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return records
-            .map(|record| SearchHit {
+    records
+        .filter_map(|record| {
+            let matched_on = match_field(
+                &record.content,
+                &record.source_app,
+                record.pastes.iter().map(|p| p.target_app.as_str()),
+                query,
+            )?;
+            Some(SearchHit {
                 record,
-                matched_on: MatchField::Content,
+                matched_on,
             })
-            .collect();
-    }
-
-    let mut hits = Vec::new();
-    for record in records {
-        if record.content.to_lowercase().contains(&q) {
-            hits.push(SearchHit {
-                record,
-                matched_on: MatchField::Content,
-            });
-            continue;
-        }
-        if record.source_app.to_lowercase().contains(&q) {
-            hits.push(SearchHit {
-                record,
-                matched_on: MatchField::SourceApp,
-            });
-            continue;
-        }
-        if record
-            .pastes
-            .iter()
-            .any(|p| p.target_app.to_lowercase().contains(&q))
-        {
-            hits.push(SearchHit {
-                record,
-                matched_on: MatchField::TargetApp,
-            });
-        }
-    }
-    hits
+        })
+        .collect()
 }

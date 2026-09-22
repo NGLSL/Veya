@@ -56,13 +56,45 @@ impl Store {
                 target_pid INTEGER NOT NULL,
                 target_window TEXT NOT NULL DEFAULT '',
                 method TEXT NOT NULL,
+                confidence TEXT NOT NULL DEFAULT 'hotkey-observed',
                 triggered_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_paste_record ON paste_trigger(clipboard_record_id);
             CREATE INDEX IF NOT EXISTS idx_record_hash ON clipboard_record(content_hash);
             CREATE INDEX IF NOT EXISTS idx_record_created ON clipboard_record(created_at_ms);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             "#,
-        )
+        )?;
+        // Older installs may predate paste_trigger.confidence.
+        let _ = self.conn.execute(
+            "ALTER TABLE paste_trigger ADD COLUMN confidence TEXT NOT NULL DEFAULT 'hotkey-observed'",
+            [],
+        );
+        Ok(())
+    }
+
+    pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn set_setting(&mut self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     pub fn insert_record(&mut self, rec: &ClipboardRecord) -> rusqlite::Result<()> {
@@ -112,8 +144,8 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO paste_trigger (
-                clipboard_record_id, target_app, target_pid, target_window, method, triggered_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                clipboard_record_id, target_app, target_pid, target_window, method, confidence, triggered_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
                 record_sequence as i64,
@@ -121,6 +153,7 @@ impl Store {
                 paste.target_pid as i64,
                 paste.target_window,
                 paste.method.label(),
+                paste.confidence.as_str(),
                 paste.triggered_at_ms,
             ],
         )?;
@@ -155,7 +188,7 @@ impl Store {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT clipboard_record_id, target_app, target_pid, target_window, method, triggered_at_ms
+            SELECT clipboard_record_id, target_app, target_pid, target_window, method, confidence, triggered_at_ms
             FROM paste_trigger
             ORDER BY triggered_at_ms ASC, id ASC
             "#,
@@ -168,7 +201,8 @@ impl Store {
                     target_pid: row.get::<_, i64>(2)? as u32,
                     target_window: row.get(3)?,
                     method: parse_method(&row.get::<_, String>(4)?),
-                    triggered_at_ms: row.get(5)?,
+                    confidence: parse_paste_confidence(&row.get::<_, String>(5)?),
+                    triggered_at_ms: row.get(6)?,
                 },
             ))
         })?;
@@ -234,6 +268,14 @@ impl Store {
             .optional()?;
         Ok(matches!(row, Some(1)))
     }
+
+    pub fn list_excluded(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT exe FROM application WHERE excluded = 1 ORDER BY exe")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
 }
 
 fn parse_confidence(s: &str) -> SourceConfidence {
@@ -249,6 +291,11 @@ fn parse_method(s: &str) -> PasteMethod {
         "Shift+Insert" => PasteMethod::ShiftInsert,
         _ => PasteMethod::CtrlV,
     }
+}
+
+fn parse_paste_confidence(_s: &str) -> veya_core::PasteConfidence {
+    // v0.1 has a single honest claim: hotkey observed, insertion unverified.
+    veya_core::PasteConfidence::HotkeyObserved
 }
 
 #[cfg(test)]
@@ -272,6 +319,7 @@ mod tests {
                 target_pid: 2,
                 target_window: String::new(),
                 method: PasteMethod::CtrlV,
+                confidence: veya_core::PasteConfidence::HotkeyObserved,
                 triggered_at_ms: 2_000 + i64::from(seq),
             }],
         }

@@ -1,6 +1,6 @@
 //! Stored flow records. Raw events stay separate; UI aggregation is a view.
 
-use crate::events::{PasteMethod, SourceConfidence};
+use crate::events::{PasteConfidence, PasteMethod, SourceConfidence};
 
 /// One observed paste trigger attached to a clipboard record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,7 +9,8 @@ pub struct PasteTriggerRecord {
     pub target_pid: u32,
     pub target_window: String,
     pub method: PasteMethod,
-    /// Hotkey observed; insertion into the target is NOT claimed.
+    pub confidence: PasteConfidence,
+    /// Unix epoch milliseconds.
     pub triggered_at_ms: i64,
 }
 

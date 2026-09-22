@@ -4,11 +4,11 @@
 
 **Blocked by:** 02 (Copy → History card)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Double-click / Enter (and explicit Copy action) writes clipboard text from the selected record
-- [ ] The matching clipboard event is suppressed via InternalClipboardWrite (expected_sequence + hash), not blanket Source==Veya
-- [ ] Unrelated or user-driven writes still create normal ClipboardRecords
-- [ ] Pending internal token clears after match or timeout; no permanent ignore
+- [x] Double-click / Enter (and explicit Copy action) writes clipboard text from the selected record — Enter + Copy button (double-click N/A in iced 0.13)
+- [x] The matching clipboard event is suppressed via InternalClipboardWrite (expected_sequence + hash), not blanket Source==Veya — InternalClipboardWrite expected_sequence+hash
+- [x] Unrelated or user-driven writes still create normal ClipboardRecords — hash/seq mismatch still records
+- [x] Pending internal token clears after match or timeout; no permanent ignore — match or expire_stale_pending
 
 ## Comments

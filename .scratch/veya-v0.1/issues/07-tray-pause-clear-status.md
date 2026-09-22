@@ -4,13 +4,13 @@
 
 **Blocked by:** 02 (Copy → History card)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Tray icon + context menu with the six actions above
-- [ ] Pause for 10 minutes auto-resumes; Pause tracking lasts until resumed
-- [ ] Tray icon reflects paused vs tracking
-- [ ] While paused, no new ClipboardRecord / PasteTrigger is stored
-- [ ] Clear history removes all records and dependent paste triggers
-- [ ] Status line shows count, Local only, retention window
+- [x] Tray icon + context menu with the six actions above — Shell_NotifyIcon + 6 menu items
+- [x] Pause for 10 minutes auto-resumes; Pause tracking lasts until resumed — Pause 10 min timer + Pause tracking
+- [x] Tray icon reflects paused vs tracking — paused icon (IDI_WARNING) + tip
+- [x] While paused, no new ClipboardRecord / PasteTrigger is stored — tracking=false skips store
+- [x] Clear history removes all records and dependent paste triggers — clear cascades paste_trigger
+- [x] Status line shows count, Local only, retention window — count · Local only · retention
 
 ## Comments

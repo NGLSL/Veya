@@ -19,6 +19,55 @@ impl SourceConfidence {
             SourceConfidence::Unknown => "unknown",
         }
     }
+
+    /// Display label for a source app. Inference marks live here only — never in stored exe names.
+    pub fn display_source(self, source_app: &str) -> String {
+        match self {
+            SourceConfidence::Exact => source_app.to_string(),
+            SourceConfidence::Likely => format!("{source_app} (fg?)"),
+            SourceConfidence::Unknown => {
+                if source_app == "unknown" {
+                    source_app.to_string()
+                } else {
+                    format!("{source_app} (?)")
+                }
+            }
+        }
+    }
+
+    /// User-facing explanation when attribution is not Exact.
+    pub fn hint(self) -> &'static str {
+        match self {
+            SourceConfidence::Exact => "",
+            SourceConfidence::Likely => {
+                "Source inferred from foreground application. Clipboard owner was unavailable."
+            }
+            SourceConfidence::Unknown => "Source could not be attributed.",
+        }
+    }
+}
+
+/// What a paste observation claims. Insertion into the target is never verified in v0.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteConfidence {
+    /// Hotkey + foreground app observed; insertion not verified.
+    HotkeyObserved,
+}
+
+impl PasteConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PasteConfidence::HotkeyObserved => "hotkey-observed",
+        }
+    }
+
+    pub fn detail_copy(self) -> &'static str {
+        match self {
+            PasteConfidence::HotkeyObserved => {
+                "Paste trigger detected — insertion not verified"
+            }
+        }
+    }
 }
 
 /// Paste shortcut that fired the trigger.

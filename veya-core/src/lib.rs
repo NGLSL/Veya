@@ -15,8 +15,9 @@ pub mod search;
 
 pub use aggregate::{HistoryCard, UsedInSummary};
 pub use events::{
-    ClipboardChange, InternalClipboardWrite, PasteMethod, PasteTrigger, SourceConfidence,
+    ClipboardChange, InternalClipboardWrite, PasteConfidence, PasteMethod, PasteTrigger,
+    SourceConfidence,
 };
 pub use flow::{FlowEngine, FlowOutcome};
 pub use model::{ClipboardRecord, PasteTriggerRecord};
-pub use search::SearchHit;
+pub use search::{match_field, MatchField, SearchHit};

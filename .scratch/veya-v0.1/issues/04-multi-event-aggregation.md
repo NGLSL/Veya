@@ -4,13 +4,13 @@
 
 **Blocked by:** 03 (PasteTrigger → Used in / Flow detail)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Copy A / Copy B remain separate records; pastes never attach to the wrong record
-- [ ] Repeated paste triggers on one record accumulate (list does not explode)
-- [ ] Copy without paste is kept and labeled "No paste activity"
-- [ ] UI aggregates near-identical short-window copies (e.g. "Copied 5× within 4s") without merging raw storage rows
-- [ ] Expand/detail can show raw clipboard events for an aggregated group
-- [ ] Aggregated group still shows combined Used-in when flows differ per raw copy
+- [x] Copy A / Copy B remain separate records; pastes never attach to the wrong record — core tests A/B + paste attach
+- [x] Repeated paste triggers on one record accumulate (list does not explode) — pastes accumulate
+- [x] Copy without paste is kept and labeled "No paste activity" — No paste activity label
+- [x] UI aggregates near-identical short-window copies (e.g. "Copied 5× within 4s") without merging raw storage rows — AGGREGATION_WINDOW_MS view-only
+- [x] Expand/detail can show raw clipboard events for an aggregated group — raw_sequences toggle
+- [x] Aggregated group still shows combined Used-in when flows differ per raw copy — combined Used-in on aggregate
 
 ## Comments

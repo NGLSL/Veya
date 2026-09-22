@@ -4,13 +4,13 @@
 
 **Blocked by:** 02 (Copy → History card)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Ctrl+V and Shift+Insert attach a PasteTrigger to the current ClipboardRecord
-- [ ] Flow detail shows Copied from + Used in rows (app, method, time)
-- [ ] Card Used-in line summarizes targets (e.g. WeChat · IDEA) or count
-- [ ] Detail honesty: "Ctrl+V detected" / "Insertion not verified" (not claimed insertion)
-- [ ] Foreground app at trigger time is the Used-in target (Alt+Tab safe)
-- [ ] Elevated / cross-IL gaps render fallbacks, no crash or invented names
+- [x] Ctrl+V and Shift+Insert attach a PasteTrigger to the current ClipboardRecord — Ctrl+V / Shift+Insert attach
+- [x] Flow detail shows Copied from + Used in rows (app, method, time) — detail rows app+method+time
+- [x] Card Used-in line summarizes targets (e.g. WeChat · IDEA) or count — card Used-in app list
+- [x] Detail honesty: "Ctrl+V detected" / "Insertion not verified" (not claimed insertion) — detail_copy honesty
+- [x] Foreground app at trigger time is the Used-in target (Alt+Tab safe) — foreground app at trigger
+- [x] Elevated / cross-IL gaps render fallbacks, no crash or invented names — fallbacks, no invented names
 
 ## Comments

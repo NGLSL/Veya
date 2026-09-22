@@ -4,13 +4,13 @@
 
 **Blocked by:** 01 (Prefactor — workspace + veya-core Flow seam)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Text clipboard change produces a ClipboardRecord and appears as a History card
-- [ ] Card shows content preview, source app, time
-- [ ] SourceConfidence is visible: Exact plain, Likely as `xxx.exe (fg?)` (or similar), Unknown marked; never fake Exact
-- [ ] Likely/Unknown detail copy explains inference ("Source inferred from foreground application…")
-- [ ] Long text: full content retained, card truncated; Chinese/multiline/emoji preserved
-- [ ] User-facing honesty: model/docs say PasteTrigger for pastes (this ticket is copy-only)
+- [x] Text clipboard change produces a ClipboardRecord and appears as a History card — SQLite + History card
+- [x] Card shows content preview, source app, time — preview/source/time
+- [x] SourceConfidence is visible: Exact plain, Likely as `xxx.exe (fg?)` (or similar), Unknown marked; never fake Exact — Exact/Likely(fg?)/Unknown via SourceConfidence
+- [x] Likely/Unknown detail copy explains inference ("Source inferred from foreground application…") — confidence_hint in detail
+- [x] Long text: full content retained, card truncated; Chinese/multiline/emoji preserved — full content stored, preview truncated
+- [x] User-facing honesty: model/docs say PasteTrigger for pastes (this ticket is copy-only) — PasteTrigger wording preserved
 
 ## Comments
