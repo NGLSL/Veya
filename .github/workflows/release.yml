@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated release tag
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,17 +17,26 @@ permissions:
 jobs:
   release:
     runs-on: windows-2022
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4.4.0
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
+      - name: Restore annotated tag ref
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "Invalid release tag: $env:RELEASE_TAG" }
+          git fetch origin "+refs/tags/$($env:RELEASE_TAG):refs/tags/$($env:RELEASE_TAG)" --force
+          if ($LASTEXITCODE -ne 0) { throw "Cannot fetch annotated tag: $env:RELEASE_TAG" }
       - name: Validate release tag and CI
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: ./scripts/validate-release.ps1
+        run: ./scripts/validate-release.ps1 -Tag $env:RELEASE_TAG
       - name: Install Rust toolchain
         shell: pwsh
         run: |
@@ -44,10 +59,11 @@ jobs:
         run: ./scripts/build-installer.ps1 -Nsis 'C:\Program Files (x86)\NSIS\makensis.exe'
       - name: Assemble release notes and checksum
         shell: pwsh
-        run: ./scripts/generate-release-report.ps1
+        run: ./scripts/generate-release-report.ps1 -Tag $env:RELEASE_TAG
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: |
             artifacts/veya-setup.exe
             artifacts/veya-setup.exe.sha256

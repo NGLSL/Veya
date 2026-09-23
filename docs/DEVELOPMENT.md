@@ -95,7 +95,7 @@ finally {
 
 编辑前后都检查 `git status --short` 和目标文件的 diff。按职责拆分改动：core 语义、storage 持久化、Windows 适配、worker 编排和 Iced 视图分别保持清晰；不要顺手格式化或重写无关的已有脏改动。
 
-提交前让提交内容只包含当前目标所需文件，提交说明写清用户可见行为或模块边界，并列出实际运行过的验证命令。本地 Git checkout 当前没有预设 remote；推送到 `NGLSL/Veya` 前须先核对 remote 和目标分支。
+提交前让提交内容只包含当前目标所需文件，提交说明写清用户可见行为或模块边界，并列出实际运行过的验证命令。推送到 `NGLSL/Veya` 前须核对 remote 和目标分支。
 
 ## 发布流程
 
@@ -103,6 +103,8 @@ finally {
 2. 将候选提交推到 GitHub 默认分支，等待该提交的 `CI` push run 成功；确认 Windows 安装、覆盖升级及卸载的实际验收结果。
 3. 在同一提交创建并推送注释标签 `vX.Y.Z`。`release.yml` 检查标签格式、Cargo 版本、发布说明、默认分支包含关系和该提交的成功 CI 后，重新运行测试、构建 NSIS 安装包、生成 SHA-256 并发布 GitHub Release。
 4. 发布后下载安装包，独立复算 SHA-256，并核对发布页和安装行为。仓库首次推送与实际发布属于单独操作，配置文件本身不会触发发布。
+
+如果标签已推送而 Release workflow 在创建 Release 前失败，先修复工作流并提交到默认分支，再在 GitHub Actions 手动运行 `Release`，传入原有的 `vX.Y.Z` 标签。也可执行 `gh workflow run release.yml --repo NGLSL/Veya --ref main -f tag=vX.Y.Z`。重试仍检验该注释标签的版本、默认分支包含关系和标签提交的成功 CI；不要移动已发布的标签。
 
 ## Issue 与文档
 
