@@ -32,7 +32,9 @@ Section "Veya" SEC_MAIN
   ExecWait '"$SYSDIR\taskkill.exe" /F /IM veya.exe'
   Sleep 300
   SetOutPath "$INSTDIR"
+  Delete "$INSTDIR\veya-icon-*.ico"
   File /oname=veya.exe "${APP_BINARY}"
+  File /oname=${APP_ICON_NAME} "..\icons\icon.ico"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\Veya" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "DisplayName" "Veya"
@@ -45,11 +47,11 @@ SectionEnd
 
 Section "开始菜单快捷方式" SEC_START
   CreateDirectory "$SMPROGRAMS\Veya"
-  CreateShortcut "$SMPROGRAMS\Veya\Veya.lnk" "$INSTDIR\veya.exe" "" "$INSTDIR\veya.exe" 0
+  CreateShortcut "$SMPROGRAMS\Veya\Veya.lnk" "$INSTDIR\veya.exe" "" "$INSTDIR\${APP_ICON_NAME}" 0
 SectionEnd
 
 Section "桌面快捷方式" SEC_DESKTOP
-  CreateShortcut "$DESKTOP\Veya.lnk" "$INSTDIR\veya.exe" "" "$INSTDIR\veya.exe" 0
+  CreateShortcut "$DESKTOP\Veya.lnk" "$INSTDIR\veya.exe" "" "$INSTDIR\${APP_ICON_NAME}" 0
 SectionEnd
 
 Section "Uninstall"
@@ -57,6 +59,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Veya\Veya.lnk"
   RMDir "$SMPROGRAMS\Veya"
   Delete "$INSTDIR\veya.exe"
+  Delete "$INSTDIR\veya-icon-*.ico"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya"

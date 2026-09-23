@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn rejects_unintended_single_keys_and_reserved_f12_or_alt_f4() {
         for shortcut in [
-            "V", "Shift+V", "Alt+F4", "Ctrl+F12", "Win+V", "Alt+?", "Alt+",
+            "V", "F3", "Shift+V", "Alt+F4", "Ctrl+F12", "Win+V", "Alt+?", "Alt+",
         ] {
             assert_eq!(Hotkey::parse(shortcut), None, "{shortcut}");
         }

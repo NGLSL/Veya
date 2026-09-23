@@ -5,6 +5,8 @@ pub mod chrome;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
+pub mod elevation;
+#[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
 pub mod icon;

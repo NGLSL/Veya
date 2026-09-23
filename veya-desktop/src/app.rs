@@ -43,7 +43,9 @@ fn show_initial_window(physical_position: Option<(f32, f32)>) -> Task<Message> {
                     iced::window::move_to(id, iced::Point::new(logical.0, logical.1))
                 })
                 .unwrap_or_else(Task::none);
-            move_window.chain(iced::window::change_mode(id, iced::window::Mode::Windowed))
+            move_window
+                .chain(iced::window::change_mode(id, iced::window::Mode::Windowed))
+                .chain(Task::done(Message::WindowReady(id)))
         })
     })
 }
@@ -227,6 +229,7 @@ pub struct App {
     tray_rx: Option<std::sync::mpsc::Receiver<TrayCmd>>,
     activation_rx: std::sync::mpsc::Receiver<WindowSignal>,
     window_hidden: bool,
+    window_id: Option<iced::window::Id>,
     hotkey_recording: bool,
     hotkey_record_error: Option<String>,
     state: UiState,
@@ -288,6 +291,7 @@ pub enum Message {
     SetSortOrder(SortOrder),
     ToggleListDensity,
     WindowDrag,
+    WindowReady(iced::window::Id),
     WindowMinimize,
     WindowToggleMaximize,
     WindowResized(iced::Size),
@@ -330,6 +334,7 @@ impl App {
                 tray_rx,
                 activation_rx,
                 window_hidden: false,
+                window_id: None,
                 hotkey_recording: false,
                 hotkey_record_error: None,
                 tracking_control: TrackingControl::default(),
@@ -663,8 +668,14 @@ impl App {
                 };
                 Task::none()
             }
-            Message::WindowDrag => iced::window::get_latest()
-                .then(|id| id.map(iced::window::drag).unwrap_or_else(Task::none)),
+            Message::WindowDrag => self
+                .window_id
+                .map(iced::window::drag)
+                .unwrap_or_else(Task::none),
+            Message::WindowReady(id) => {
+                self.window_id = Some(id);
+                Task::none()
+            }
             Message::WindowMinimize => {
                 self.cancel_hotkey_recording();
                 self.window_hidden = false;
@@ -681,6 +692,7 @@ impl App {
                 Task::none()
             }
             Message::WindowRestored(id) => {
+                self.window_id = Some(id);
                 #[cfg(windows)]
                 veya_windows::platform::singleton::ensure_main_window_visible();
                 self.chrome_sync_pending = true;
@@ -1049,7 +1061,8 @@ impl App {
 
         container(
             column![
-                container(logo).padding(pad(20.0, 14.0, 22.0, 14.0)),
+                mouse_area(container(logo).padding(pad(20.0, 14.0, 22.0, 14.0)))
+                    .on_press(Message::WindowDrag),
                 column![nav_history, nav_settings]
                     .spacing(5)
                     .padding(pad(0.0, 10.0, 0.0, 10.0)),
@@ -1154,7 +1167,14 @@ impl App {
 
         let bar = row![
             container(left_part).width(Length::FillPortion(7)),
-            Space::with_width(Length::FillPortion(1)),
+            mouse_area(
+                container(meta("拖动窗口").size(11).color(theme::FAINT))
+                    .width(Length::Fixed(96.0))
+                    .height(Length::Fixed(42.0))
+                    .center_x(Length::Fixed(96.0))
+                    .center_y(Length::Fixed(42.0)),
+            )
+            .on_press(Message::WindowDrag),
             pause,
             Space::with_width(6.0),
             win,

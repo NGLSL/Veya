@@ -113,6 +113,15 @@ impl App {
             );
         }
 
+        if matches!(card.payload, CardPayloadView::Image { .. }) {
+            actions = actions.push(
+                button(meta("查看图片").size(12).color(theme::MUTED))
+                    .on_press(Message::OpenContentModal(card.sequence))
+                    .style(theme::action_button)
+                    .padding(pad(6.0, 10.0, 6.0, 10.0)),
+            );
+        }
+
         actions = actions.push(
             button(
                 row![
@@ -195,17 +204,20 @@ impl App {
                 height,
                 encoded_bytes,
             } => row![
-                container(
-                    iced::widget::image(handle.clone())
-                        .width(Length::Fixed(156.0))
-                        .height(Length::Fixed(112.0)),
+                mouse_area(
+                    container(
+                        iced::widget::image(handle.clone())
+                            .width(Length::Fixed(156.0))
+                            .height(Length::Fixed(112.0)),
+                    )
+                    .width(Length::Fixed(164.0))
+                    .height(Length::Fixed(120.0))
+                    .center_x(Length::Fixed(164.0))
+                    .center_y(Length::Fixed(120.0))
+                    .clip(true)
+                    .style(theme::inset_style),
                 )
-                .width(Length::Fixed(164.0))
-                .height(Length::Fixed(120.0))
-                .center_x(Length::Fixed(164.0))
-                .center_y(Length::Fixed(120.0))
-                .clip(true)
-                .style(theme::inset_style),
+                .on_press(Message::OpenContentModal(card.sequence)),
                 column![
                     meta("图片预览").size(11).color(theme::FAINT),
                     body(format!("{width} × {height} px"))
@@ -534,11 +546,21 @@ impl App {
         let copy_label = if self.copied_tick > 0 {
             "已复制"
         } else {
-            "复制全文"
+            if card.kind == ContentKind::Image {
+                "复制图片"
+            } else {
+                "复制全文"
+            }
         };
         let header = row![
             column![
-                body("查看完整内容").size(15).font(crate::font::name_font()),
+                body(if card.kind == ContentKind::Image {
+                    "查看图片"
+                } else {
+                    "查看完整内容"
+                })
+                .size(15)
+                .font(crate::font::name_font()),
                 meta(format!("{} · 记录 #{}", card.kind.label(), card.sequence))
                     .size(11)
                     .color(theme::FAINT),
@@ -615,16 +637,39 @@ impl App {
         })
         .style(theme::scroll_style)
         .height(Length::Fill);
-        let content = container(content_scroll)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::modal_content_style);
+        let content: Element<'_, Message> =
+            if let CardPayloadView::Image { handle, .. } = &card.payload {
+                container(
+                    iced::widget::image::viewer(handle.clone())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(iced::ContentFit::Contain),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::modal_content_style)
+                .into()
+            } else {
+                container(content_scroll)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(theme::modal_content_style)
+                    .into()
+            };
 
         let dialog = container(column![header, content, footer,].spacing(15))
             .width(Length::Fill)
-            .max_width(680)
+            .max_width(if card.kind == ContentKind::Image {
+                960
+            } else {
+                680
+            })
             .height(Length::Fill)
-            .max_height(460)
+            .max_height(if card.kind == ContentKind::Image {
+                640
+            } else {
+                460
+            })
             .padding(18)
             .style(theme::modal_panel_style);
 

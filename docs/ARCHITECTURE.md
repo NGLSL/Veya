@@ -19,7 +19,7 @@ flowchart LR
 1. `veya-windows/src/platform/` 的 Win32 消息循环发出 `PlatformEvent`。剪贴板信号包含内容及来源线索；低级键盘钩子发出粘贴触发线索；同一消息线程注册全局窗口快捷键，并在 `WM_HOTKEY` 到来时采样主窗口是否可见且未最小化。`enrich_clipboard`、`enrich_paste` 补充进程名、窗口名和时间信息。
 2. `veya-desktop/src/worker.rs` 独占运行中的 `FlowEngine` 和 `Store`：加载数据库记录、处理平台事件和 `WorkerCmd`，把变化写回 SQLite，再通过 `snapshot_from_flow` 发布 `UiState`。追踪开关的 UI 请求带序号；快照回传已处理的序号，避免定时同步把刚点击的状态短暂覆盖为旧值。
 3. `veya-desktop/src/app.rs` 的 Iced `App` 在 `Tick` 中读取快照并集中处理消息；`app/history.rs`、`app/detail.rs` 和 `app/settings.rs` 分别渲染历史、详情/完整内容弹窗和设置。`app/tracking.rs` 保存追踪开关尚未确认的请求，并用 worker 快照序号完成确认。复制、删除、排除应用等动作通过 `WorkerCmd` 发给 worker。
-4. `veya-desktop/src/main.rs` 负责单例门禁、字体和 Iced 窗口装配。第二次启动通过 `veya-windows/src/platform/singleton.rs` 通知已有实例。热键在窗口可见时隐藏，在最小化或已隐藏时唤起；托盘和单例通知始终唤起。热键注册状态由 worker 发布到设置页。
+4. `veya-desktop/src/main.rs` 在单例门禁和键盘钩子启动前，通过 `veya-windows/src/platform/elevation.rs` 检查安装器继承的管理员权限，并尝试用 Explorer 用户令牌重新启动。之后负责单例门禁、字体和 Iced 窗口装配。第二次启动通过 `veya-windows/src/platform/singleton.rs` 通知已有实例。热键在窗口可见时隐藏，在最小化或已隐藏时唤起；托盘和单例通知始终唤起。热键注册状态由 worker 发布到设置页。
 
 ## 模块职责与接口
 

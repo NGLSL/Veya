@@ -17,6 +17,14 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> iced::Result {
+    // The elevated installer may launch the finish-page app with its token.
+    // Drop to the Explorer user's token before claiming the singleton or
+    // installing any global hook so screenshot tools keep working over Veya.
+    match veya_windows::platform::elevation::relaunch_if_elevated() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => eprintln!("Veya could not leave elevated mode: {error}"),
+    }
     match veya_windows::platform::singleton::claim() {
         Ok(()) => {}
         Err(veya_windows::platform::singleton::ClaimError::AlreadyRunning) => return Ok(()),

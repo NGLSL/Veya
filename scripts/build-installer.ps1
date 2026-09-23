@@ -27,7 +27,9 @@ if (-not $version) { throw 'veya-desktop version not found' }
 $binary = Join-Path $buildDir 'release\veya.exe'
 if (-not (Test-Path -LiteralPath $binary)) { throw "Binary missing: $binary" }
 & (Join-Path $PSScriptRoot 'assert-gui-binary.ps1') -Binary $binary
-& $Nsis "/DAPP_VERSION=$version" "/DAPP_BINARY=$binary" (Join-Path $root 'installer\veya.nsi')
+$iconHash = (Get-FileHash -LiteralPath (Join-Path $root 'icons\icon.ico') -Algorithm SHA256).Hash.ToLowerInvariant()
+$iconName = "veya-icon-$($iconHash.Substring(0, 12)).ico"
+& $Nsis "/DAPP_VERSION=$version" "/DAPP_BINARY=$binary" "/DAPP_ICON_NAME=$iconName" (Join-Path $root 'installer\veya.nsi')
 if ($LASTEXITCODE -ne 0) { throw "makensis failed: $LASTEXITCODE" }
 
 $installer = Join-Path $artifacts 'veya-setup.exe'
