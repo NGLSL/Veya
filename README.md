@@ -37,7 +37,7 @@ Veya 是一个 Windows 剪贴板流转记录器：记录文本、现有文件路
 
 ## 安装包与发布
 
-发布后从 [GitHub Releases](https://github.com/NGLSL/Veya/releases) 下载 `veya-setup.exe`，并核对同页的 `veya-setup.exe.sha256`。安装器需要管理员权限写入 Program Files；覆盖安装会保留 `%APPDATA%\Veya` 中的历史和设置，卸载也不会删除这些用户数据。安装包目前未签名，Windows 可能显示未知发布者。
+发布后从 [GitHub Releases](https://github.com/NGLSL/Veya/releases) 下载 `veya-setup.exe`，并核对同页的 `veya-setup.exe.sha256`。安装器需要管理员权限写入 Program Files；组件页默认勾选开始菜单和桌面快捷方式，安装完成页可选择启动 Veya。覆盖安装会保留 `%APPDATA%\Veya` 中的历史和设置，卸载会移除快捷方式但不会删除这些用户数据。安装包目前未签名，Windows 可能显示未知发布者。
 
 本地构建安装包需要 NSIS：
 

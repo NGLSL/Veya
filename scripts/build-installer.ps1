@@ -26,6 +26,7 @@ $version = (($metadata | ConvertFrom-Json).packages | Where-Object name -eq 'vey
 if (-not $version) { throw 'veya-desktop version not found' }
 $binary = Join-Path $buildDir 'release\veya.exe'
 if (-not (Test-Path -LiteralPath $binary)) { throw "Binary missing: $binary" }
+& (Join-Path $PSScriptRoot 'assert-gui-binary.ps1') -Binary $binary
 & $Nsis "/DAPP_VERSION=$version" "/DAPP_BINARY=$binary" (Join-Path $root 'installer\veya.nsi')
 if ($LASTEXITCODE -ne 0) { throw "makensis failed: $LASTEXITCODE" }
 

@@ -1,4 +1,5 @@
 //! Veya desktop: UI → Core → Storage / Windows. No Win32 here.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
 mod capture;
