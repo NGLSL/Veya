@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Validate release tag and CI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: ./scripts/validate-release.ps1
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt
+          rustup default stable-x86_64-pc-windows-msvc
+      - name: Verify workspace
+        shell: pwsh
+        run: |
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'veya-appdata'
+          New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
+          cargo test --locked --workspace
+          if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+      - name: Build installer
+        shell: pwsh
+        run: ./scripts/build-installer.ps1 -Nsis 'C:\Program Files (x86)\NSIS\makensis.exe'
+      - name: Assemble release notes and checksum
+        shell: pwsh
+        run: ./scripts/generate-release-report.ps1
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/veya-setup.exe
+            artifacts/veya-setup.exe.sha256
+          body_path: release-body.md
+          fail_on_unmatched_files: true

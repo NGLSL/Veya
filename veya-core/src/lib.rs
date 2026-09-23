@@ -19,5 +19,5 @@ pub use events::{
     SourceConfidence,
 };
 pub use flow::{FlowEngine, FlowOutcome};
-pub use model::{ClipboardRecord, PasteTriggerRecord};
+pub use model::{payload_hash, ClipboardPayload, ClipboardRecord, PasteTriggerRecord};
 pub use search::{match_field, MatchField, SearchHit};

@@ -4,8 +4,10 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
-use veya_core::{ClipboardRecord, PasteMethod, PasteTriggerRecord, SourceConfidence};
+use rusqlite::{params, types::Type, Connection, OptionalExtension};
+use veya_core::{
+    ClipboardPayload, ClipboardRecord, PasteMethod, PasteTriggerRecord, SourceConfidence,
+};
 
 pub struct Store {
     conn: Connection,
@@ -14,22 +16,23 @@ pub struct Store {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
+    fn migrate(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
             r#"
-            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS application (
                 exe TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -46,7 +49,11 @@ impl Store {
                 source_pid INTEGER NOT NULL,
                 source_window TEXT NOT NULL DEFAULT '',
                 source_confidence TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                payload BLOB,
+                image_width INTEGER,
+                image_height INTEGER
             );
             CREATE TABLE IF NOT EXISTS paste_trigger (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,12 +75,28 @@ impl Store {
             );
             "#,
         )?;
-        // Older installs may predate paste_trigger.confidence.
-        let _ = self.conn.execute(
-            "ALTER TABLE paste_trigger ADD COLUMN confidence TEXT NOT NULL DEFAULT 'hotkey-observed'",
-            [],
-        );
-        Ok(())
+        if !has_column(&tx, "paste_trigger", "confidence")? {
+            tx.execute_batch(
+                "ALTER TABLE paste_trigger ADD COLUMN confidence TEXT NOT NULL DEFAULT 'hotkey-observed'",
+            )?;
+        }
+        if !has_column(&tx, "clipboard_record", "pinned")? {
+            tx.execute_batch(
+                "ALTER TABLE clipboard_record ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        for (name, declaration) in [
+            ("payload", "BLOB"),
+            ("image_width", "INTEGER"),
+            ("image_height", "INTEGER"),
+        ] {
+            if !has_column(&tx, "clipboard_record", name)? {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE clipboard_record ADD COLUMN {name} {declaration}"
+                ))?;
+            }
+        }
+        tx.commit()
     }
 
     pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
@@ -98,89 +121,102 @@ impl Store {
     }
 
     pub fn insert_record(&mut self, rec: &ClipboardRecord) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let (blob, width, height) = encode_payload(&rec.payload)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
             r#"
             INSERT INTO clipboard_record (
                 sequence, content_type, content, content_hash,
-                source_app, source_pid, source_window, source_confidence, created_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                source_app, source_pid, source_window, source_confidence, created_at_ms, pinned,
+                payload, image_width, image_height
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(sequence) DO UPDATE SET
+                content_type=excluded.content_type,
                 content=excluded.content,
                 content_hash=excluded.content_hash,
                 source_app=excluded.source_app,
                 source_pid=excluded.source_pid,
                 source_window=excluded.source_window,
                 source_confidence=excluded.source_confidence,
-                created_at_ms=excluded.created_at_ms
+                created_at_ms=excluded.created_at_ms,
+                pinned=excluded.pinned,
+                payload=excluded.payload,
+                image_width=excluded.image_width,
+                image_height=excluded.image_height
             "#,
             params![
                 rec.sequence as i64,
-                rec.content_type,
-                rec.content,
+                rec.payload.kind(),
+                rec.payload.display_text(),
                 rec.content_hash,
                 rec.source_app,
                 rec.source_pid as i64,
                 rec.source_window,
                 rec.source_confidence.as_str(),
                 rec.created_at_ms,
+                rec.pinned as i64,
+                blob,
+                width,
+                height,
             ],
         )?;
-        // Replace triggers for this record (simple and correct for v0.1 writes).
-        self.conn.execute(
+        // Keep payload and paste associations atomic across updates.
+        tx.execute(
             "DELETE FROM paste_trigger WHERE clipboard_record_id = ?1",
             params![rec.sequence as i64],
         )?;
         for p in &rec.pastes {
-            self.insert_paste(rec.sequence, p)?;
+            tx.execute(
+                r#"
+                INSERT INTO paste_trigger (
+                    clipboard_record_id, target_app, target_pid, target_window, method, confidence, triggered_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    rec.sequence as i64,
+                    p.target_app,
+                    p.target_pid as i64,
+                    p.target_window,
+                    p.method.label(),
+                    p.confidence.as_str(),
+                    p.triggered_at_ms,
+                ],
+            )?;
         }
-        Ok(())
-    }
-
-    pub fn insert_paste(
-        &mut self,
-        record_sequence: u32,
-        paste: &PasteTriggerRecord,
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO paste_trigger (
-                clipboard_record_id, target_app, target_pid, target_window, method, confidence, triggered_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![
-                record_sequence as i64,
-                paste.target_app,
-                paste.target_pid as i64,
-                paste.target_window,
-                paste.method.label(),
-                paste.confidence.as_str(),
-                paste.triggered_at_ms,
-            ],
-        )?;
-        Ok(())
+        tx.commit()
     }
 
     pub fn load_all(&self) -> rusqlite::Result<Vec<ClipboardRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT sequence, content_type, content, content_hash,
-                   source_app, source_pid, source_window, source_confidence, created_at_ms
+                   source_app, source_pid, source_window, source_confidence, created_at_ms, pinned,
+                   payload, image_width, image_height
             FROM clipboard_record
             ORDER BY created_at_ms ASC, sequence ASC
             "#,
         )?;
         let mut records: Vec<ClipboardRecord> = stmt
             .query_map([], |row| {
+                let content_type: String = row.get(1)?;
+                let content: String = row.get(2)?;
+                let blob: Option<Vec<u8>> = row.get(10)?;
+                let width: Option<i64> = row.get(11)?;
+                let height: Option<i64> = row.get(12)?;
+                let payload = decode_payload(&content_type, &content, blob, width, height)?;
+                let content = payload.display_text();
                 Ok(ClipboardRecord {
                     sequence: row.get::<_, i64>(0)? as u32,
-                    content_type: row.get(1)?,
-                    content: row.get(2)?,
+                    content_type,
+                    content,
+                    payload,
                     content_hash: row.get(3)?,
                     source_app: row.get(4)?,
                     source_pid: row.get::<_, i64>(5)? as u32,
                     source_window: row.get(6)?,
                     source_confidence: parse_confidence(&row.get::<_, String>(7)?),
                     created_at_ms: row.get(8)?,
+                    pinned: row.get::<_, i64>(9)? != 0,
                     pastes: Vec::new(),
                 })
             })?
@@ -222,16 +258,42 @@ impl Store {
         )
     }
 
+    pub fn delete_records(&mut self, sequences: &[u32]) -> rusqlite::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut deleted = 0;
+        for sequence in sequences {
+            deleted += tx.execute(
+                "DELETE FROM clipboard_record WHERE sequence = ?1",
+                params![*sequence as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Apply a card-level pin action to its raw records atomically.
+    pub fn set_pinned(&mut self, sequences: &[u32], pinned: bool) -> rusqlite::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut changed = 0;
+        for sequence in sequences {
+            changed += tx.execute(
+                "UPDATE clipboard_record SET pinned = ?1 WHERE sequence = ?2 AND pinned != ?1",
+                params![pinned as i64, *sequence as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn clear(&mut self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
-            "DELETE FROM paste_trigger; DELETE FROM clipboard_record;",
-        )
+        self.conn.execute("DELETE FROM clipboard_record", [])?;
+        Ok(())
     }
 
     /// Delete records older than `cutoff_ms`. Returns rows removed.
     pub fn purge_older_than(&mut self, cutoff_ms: i64) -> rusqlite::Result<usize> {
         self.conn.execute(
-            "DELETE FROM clipboard_record WHERE created_at_ms < ?1",
+            "DELETE FROM clipboard_record WHERE created_at_ms < ?1 AND pinned = 0",
             params![cutoff_ms],
         )
     }
@@ -278,6 +340,80 @@ impl Store {
     }
 }
 
+fn has_column(conn: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn encode_payload(
+    payload: &ClipboardPayload,
+) -> rusqlite::Result<(Option<Vec<u8>>, Option<i64>, Option<i64>)> {
+    match payload {
+        ClipboardPayload::Text(_) => Ok((None, None, None)),
+        ClipboardPayload::Files(paths) => serde_json::to_vec(paths)
+            .map(|bytes| (Some(bytes), None, None))
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error))),
+        ClipboardPayload::Image { png, width, height } => Ok((
+            Some(png.clone()),
+            Some(i64::from(*width)),
+            Some(i64::from(*height)),
+        )),
+    }
+}
+
+fn invalid_payload(message: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        10,
+        Type::Blob,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message.to_string(),
+        )),
+    )
+}
+
+fn decode_payload(
+    kind: &str,
+    content: &str,
+    blob: Option<Vec<u8>>,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> rusqlite::Result<ClipboardPayload> {
+    match kind {
+        "text" => Ok(ClipboardPayload::Text(content.to_string())),
+        "files" => {
+            let bytes = blob.ok_or_else(|| invalid_payload("missing file-list payload"))?;
+            let paths: Vec<String> = serde_json::from_slice(&bytes).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(10, Type::Blob, Box::new(error))
+            })?;
+            if paths.is_empty() {
+                return Err(invalid_payload("empty file-list payload"));
+            }
+            Ok(ClipboardPayload::Files(paths))
+        }
+        "image" => {
+            let png = blob.ok_or_else(|| invalid_payload("missing image payload"))?;
+            let width = width.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+            let height = height
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0);
+            match (width, height) {
+                (Some(width), Some(height)) if !png.is_empty() => {
+                    Ok(ClipboardPayload::Image { png, width, height })
+                }
+                _ => Err(invalid_payload("invalid image payload")),
+            }
+        }
+        _ => Err(invalid_payload("unknown clipboard payload type")),
+    }
+}
+
 fn parse_confidence(s: &str) -> SourceConfidence {
     match s {
         "exact" => SourceConfidence::Exact,
@@ -308,12 +444,14 @@ mod tests {
             sequence: seq,
             content_type: "text".into(),
             content: format!("text-{seq}"),
+            payload: ClipboardPayload::Text(format!("text-{seq}")),
             content_hash: format!("h{seq}"),
             source_app: "chrome.exe".into(),
             source_pid: 1,
             source_window: "Chrome".into(),
             source_confidence: SourceConfidence::Exact,
             created_at_ms: 1_000 + i64::from(seq),
+            pinned: false,
             pastes: vec![PasteTriggerRecord {
                 target_app: "notepad.exe".into(),
                 target_pid: 2,
@@ -366,5 +504,126 @@ mod tests {
         let left = store.load_all().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].sequence, 2);
+    }
+
+    #[test]
+    fn pinning_multiple_raw_records_survives_reload_and_exempts_retention() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.insert_record(&rec(1)).unwrap();
+        store.insert_record(&rec(2)).unwrap();
+        store.insert_record(&rec(3)).unwrap();
+        assert_eq!(store.set_pinned(&[1, 2], true).unwrap(), 2);
+        assert_eq!(store.purge_older_than(2_000).unwrap(), 1);
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|record| record.pinned));
+
+        assert_eq!(store.set_pinned(&[1, 2], false).unwrap(), 2);
+        assert_eq!(store.purge_older_than(2_000).unwrap(), 2);
+        assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_also_removes_pinned_records() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.insert_record(&rec(1)).unwrap();
+        store.set_pinned(&[1], true).unwrap();
+        store.clear().unwrap();
+        assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrates_legacy_text_records_with_unpinned_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE clipboard_record (
+                sequence INTEGER PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                source_app TEXT NOT NULL,
+                source_pid INTEGER NOT NULL,
+                source_window TEXT NOT NULL DEFAULT '',
+                source_confidence TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE paste_trigger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                clipboard_record_id INTEGER NOT NULL,
+                target_app TEXT NOT NULL,
+                target_pid INTEGER NOT NULL,
+                target_window TEXT NOT NULL DEFAULT '',
+                method TEXT NOT NULL,
+                triggered_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO clipboard_record VALUES
+                (42, 'text', 'legacy text', 'h42', 'legacy.exe', 7, '', 'exact', 1000);
+            "#,
+        )
+        .unwrap();
+        let mut store = Store { conn };
+        store.migrate().unwrap();
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "legacy text");
+        assert!(!loaded[0].pinned);
+    }
+
+    #[test]
+    fn typed_payloads_round_trip_without_becoming_text() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut files = rec(1);
+        files.payload =
+            ClipboardPayload::Files(vec![r"C:\临时\a.txt".into(), r"C:\临时\folder".into()]);
+        let mut image = rec(2);
+        image.payload = ClipboardPayload::Image {
+            png: vec![137, 80, 78, 71],
+            width: 320,
+            height: 240,
+        };
+        store.insert_record(&files).unwrap();
+        store.insert_record(&image).unwrap();
+
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded[0].payload, files.payload);
+        assert_eq!(loaded[0].content_type, "files");
+        assert_eq!(loaded[1].payload, image.payload);
+        assert_eq!(loaded[1].content_type, "image");
+    }
+
+    #[test]
+    fn failed_migration_keeps_existing_history_intact() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE clipboard_record (
+                sequence INTEGER PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                source_app TEXT NOT NULL,
+                source_pid INTEGER NOT NULL,
+                source_window TEXT NOT NULL,
+                source_confidence TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO clipboard_record VALUES (1, 'text', 'keep me', 'h1', 'old.exe', 1, '', 'exact', 1);
+            CREATE VIEW paste_trigger AS SELECT 1 AS clipboard_record_id;
+            "#,
+        )
+        .unwrap();
+        let mut store = Store { conn };
+        assert!(store.migrate().is_err());
+        let content: String = store
+            .conn
+            .query_row(
+                "SELECT content FROM clipboard_record WHERE sequence = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "keep me");
+        assert!(!has_column(&store.conn, "clipboard_record", "pinned").unwrap());
     }
 }

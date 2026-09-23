@@ -1,14 +1,14 @@
 //! Behavior tests at the pre-agreed seam: `veya-core` FlowEngine public API.
 
 use veya_core::{
-    ClipboardChange, FlowEngine, FlowOutcome, InternalClipboardWrite, PasteMethod, PasteTrigger,
-    SourceConfidence,
+    ClipboardChange, ClipboardPayload, FlowEngine, FlowOutcome, InternalClipboardWrite,
+    PasteMethod, PasteTrigger, SourceConfidence,
 };
 
 fn change(sequence: u32, text: &str, hash: &str, source_exe: &str, t: i64) -> ClipboardChange {
     ClipboardChange {
         sequence,
-        text: text.to_string(),
+        payload: ClipboardPayload::Text(text.to_string()),
         content_hash: hash.to_string(),
         source_pid: 1000 + sequence,
         source_exe: source_exe.to_string(),
@@ -85,6 +85,26 @@ fn copy_a_and_copy_b_do_not_cross_link() {
 }
 
 #[test]
+fn untracked_clipboard_change_breaks_previous_paste_association() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(1, "previous", "h1", "chrome.exe", 1_000));
+
+    flow.on_untracked_clipboard_change(2);
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 2_000)),
+        FlowOutcome::PasteWithoutRecord
+    );
+    assert!(flow.record(1).unwrap().pastes.is_empty());
+    assert_eq!(flow.len(), 1);
+
+    flow.on_clipboard_change(change(3, "next", "h3", "code.exe", 3_000));
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 4_000)),
+        FlowOutcome::PasteAttached { sequence: 3 }
+    );
+}
+
+#[test]
 fn many_paste_triggers_accumulate_on_one_record() {
     let mut flow = FlowEngine::new();
     flow.on_clipboard_change(change(1, "hello", "h1", "chrome.exe", 1_000));
@@ -123,7 +143,8 @@ fn internal_write_suppresses_only_matching_veya_write() {
         expected_sequence: Some(9),
         hash: "h-self".to_string(),
     });
-    let suppressed = flow.on_clipboard_change(change(9, "copied from veya", "h-self", "veya.exe", 5_000));
+    let suppressed =
+        flow.on_clipboard_change(change(9, "copied from veya", "h-self", "veya.exe", 5_000));
     assert_eq!(
         suppressed,
         FlowOutcome::SuppressedInternalWrite { sequence: 9 }
@@ -149,6 +170,57 @@ fn internal_write_hash_mismatch_is_not_suppressed() {
 }
 
 #[test]
+fn internal_image_write_uses_exact_owner_sequence_when_encoding_changes() {
+    let mut flow = FlowEngine::new();
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: None,
+        hash: "png-before-replay".into(),
+    });
+    flow.confirm_internal_write(9, 1234);
+    let mut rewritten = change(9, "", "png-after-replay", "veya.exe", 5_000);
+    rewritten.source_pid = 1234;
+    rewritten.source_confidence = SourceConfidence::Exact;
+    assert_eq!(
+        flow.on_clipboard_change(rewritten),
+        FlowOutcome::SuppressedInternalWrite { sequence: 9 }
+    );
+    assert!(flow.is_empty());
+}
+
+#[test]
+fn sequence_only_suppression_requires_the_exact_veya_owner() {
+    let mut flow = FlowEngine::new();
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: None,
+        hash: "expected".into(),
+    });
+    flow.confirm_internal_write(9, 1234);
+    let mut other = change(9, "other", "different", "other.exe", 5_000);
+    other.source_pid = 5678;
+    assert_eq!(
+        flow.on_clipboard_change(other),
+        FlowOutcome::Recorded { sequence: 9 }
+    );
+}
+
+#[test]
+fn unsequenced_internal_write_token_expires_after_the_next_different_event() {
+    let mut flow = FlowEngine::new();
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: None,
+        hash: "h-self".to_string(),
+    });
+
+    let first = flow.on_clipboard_change(change(9, "other", "h-other", "code.exe", 5_000));
+    assert_eq!(first, FlowOutcome::Recorded { sequence: 9 });
+
+    let later =
+        flow.on_clipboard_change(change(10, "copied from Veya", "h-self", "code.exe", 6_000));
+    assert_eq!(later, FlowOutcome::Recorded { sequence: 10 });
+    assert_eq!(flow.len(), 2);
+}
+
+#[test]
 fn history_cards_aggregate_short_window_identical_copies_without_merging_raw() {
     let mut flow = FlowEngine::new();
     flow.on_clipboard_change(change(1, "hello", "h1", "GameViewer.exe", 1_000));
@@ -161,9 +233,11 @@ fn history_cards_aggregate_short_window_identical_copies_without_merging_raw() {
 
     let cards = flow.history_cards();
     assert_eq!(cards.len(), 2);
-    assert_eq!(cards[0].copy_count, 3);
-    assert_eq!(cards[0].raw_sequences, vec![1, 2, 3]);
-    assert_eq!(cards[1].copy_count, 1);
+    // 最新优先：B（seq 4）在前，聚合的 A 在后
+    assert_eq!(cards[0].copy_count, 1);
+    assert_eq!(cards[0].raw_sequences, vec![4]);
+    assert_eq!(cards[1].copy_count, 3);
+    assert_eq!(cards[1].raw_sequences, vec![1, 2, 3]);
 }
 
 #[test]
@@ -178,8 +252,40 @@ fn history_cards_combine_used_in_across_aggregated_copies() {
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0].copy_count, 2);
     assert!(cards[0].has_paste_activity);
-    let targets: Vec<_> = cards[0].used_in.iter().map(|u| u.target_app.as_str()).collect();
-    assert_eq!(targets, vec!["idea64.exe", "weixin.exe"]);
+    let targets: Vec<_> = cards[0]
+        .used_in
+        .iter()
+        .map(|u| u.target_app.as_str())
+        .collect();
+    // 使用记录也是最新优先
+    assert_eq!(targets, vec!["weixin.exe", "idea64.exe"]);
+}
+
+#[test]
+fn pinning_a_card_updates_all_raw_copies_without_pinning_future_copies() {
+    let mut flow = FlowEngine::new();
+    for (sequence, time) in [(1, 1_000), (2, 2_000)] {
+        flow.on_clipboard_change(change(sequence, "hello", "h1", "chrome.exe", time));
+    }
+    let card = &flow.history_cards()[0];
+    assert_eq!(card.raw_sequences, vec![1, 2]);
+    let sequences = card.raw_sequences.clone();
+
+    assert_eq!(flow.set_pinned(&sequences, true), 2);
+    assert!(flow.record(1).unwrap().pinned);
+    assert!(flow.record(2).unwrap().pinned);
+    flow.on_clipboard_change(change(3, "hello", "h1", "chrome.exe", 3_000));
+
+    let cards = flow.history_cards();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[0].raw_sequences, vec![3]);
+    assert!(!cards[0].pinned);
+    assert_eq!(cards[1].raw_sequences, vec![1, 2]);
+    assert!(cards[1].pinned);
+
+    assert_eq!(flow.set_pinned(&sequences, false), 2);
+    assert!(!flow.record(1).unwrap().pinned);
+    assert!(!flow.record(2).unwrap().pinned);
 }
 
 #[test]
@@ -222,4 +328,59 @@ fn source_confidence_labels_are_stable() {
     assert_eq!(SourceConfidence::Exact.as_str(), "exact");
     assert_eq!(SourceConfidence::Likely.as_str(), "likely");
     assert_eq!(SourceConfidence::Unknown.as_str(), "unknown");
+}
+
+#[test]
+fn payload_hash_separates_types_and_file_boundaries() {
+    use veya_core::payload_hash;
+    let text = ClipboardPayload::Text("C:\\temp\\a.txt".into());
+    let files = ClipboardPayload::Files(vec!["C:\\temp\\a.txt".into()]);
+    let other_files = ClipboardPayload::Files(vec!["C:\\temp\\a".into(), ".txt".into()]);
+    assert_ne!(payload_hash(&text), payload_hash(&files));
+    assert_ne!(payload_hash(&files), payload_hash(&other_files));
+}
+
+#[test]
+fn file_then_image_paste_is_attached_to_image_only() {
+    let mut flow = FlowEngine::new();
+    let files = ClipboardPayload::Files(vec![r"C:\temp\a.txt".into()]);
+    let mut first = change(1, "", "", "explorer.exe", 1_000);
+    first.content_hash = veya_core::payload_hash(&files);
+    first.payload = files.clone();
+    flow.on_clipboard_change(first);
+
+    let image = ClipboardPayload::Image {
+        png: vec![1, 2, 3],
+        width: 1,
+        height: 1,
+    };
+    let mut second = change(2, "", "", "snippingtool.exe", 2_000);
+    second.content_hash = veya_core::payload_hash(&image);
+    second.payload = image.clone();
+    flow.on_clipboard_change(second);
+    flow.on_paste_trigger(paste("paint.exe", 3_000));
+
+    assert_eq!(flow.record(1).unwrap().payload, files);
+    assert!(flow.record(1).unwrap().pastes.is_empty());
+    assert_eq!(flow.record(2).unwrap().payload, image);
+    assert_eq!(flow.record(2).unwrap().pastes.len(), 1);
+}
+
+#[test]
+fn restored_or_deleted_history_does_not_claim_new_pastes() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(1, "old", "h1", "chrome.exe", 1_000));
+    let old = flow.record(1).unwrap().clone();
+    flow.clear();
+    flow.restore_record(old);
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 2_000)),
+        FlowOutcome::PasteWithoutRecord
+    );
+    flow.on_clipboard_change(change(2, "new", "h2", "chrome.exe", 3_000));
+    flow.delete_record(2);
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 4_000)),
+        FlowOutcome::PasteWithoutRecord
+    );
 }

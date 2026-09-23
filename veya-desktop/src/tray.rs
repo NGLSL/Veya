@@ -53,15 +53,24 @@ pub fn apply_tray_action(cmd: &TrayCmd, worker: &crate::worker::WorkerHandle) ->
             true
         }
         TrayCmd::PauseTracking => {
-            let _ = worker.cmd_tx.send(WorkerCmd::SetTracking(false));
+            let _ = worker.cmd_tx.send(WorkerCmd::SetTracking {
+                on: false,
+                request_id: None,
+            });
             true
         }
         TrayCmd::ResumeTracking => {
-            let _ = worker.cmd_tx.send(WorkerCmd::SetTracking(true));
+            let _ = worker.cmd_tx.send(WorkerCmd::SetTracking {
+                on: true,
+                request_id: None,
+            });
             true
         }
         TrayCmd::Pause10Min => {
-            let _ = worker.cmd_tx.send(WorkerCmd::SetTracking(false));
+            let _ = worker.cmd_tx.send(WorkerCmd::SetTracking {
+                on: false,
+                request_id: None,
+            });
             true
         }
         TrayCmd::OpenWindow | TrayCmd::OpenSettings | TrayCmd::Exit => false,

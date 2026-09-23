@@ -86,9 +86,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
             let vk = kb.vkCode;
 
             match vk {
-                VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
-                    SHIFT_DOWN.store(is_down, Ordering::Relaxed)
-                }
+                VK_SHIFT | VK_LSHIFT | VK_RSHIFT => SHIFT_DOWN.store(is_down, Ordering::Relaxed),
                 VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
                     CTRL_DOWN.store(is_down, Ordering::Relaxed)
                 }

@@ -7,4 +7,5 @@ description = "SQLite persistence for Veya flow records"
 
 [dependencies]
 veya-core = { workspace = true }
+serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -24,12 +24,12 @@ impl SourceConfidence {
     pub fn display_source(self, source_app: &str) -> String {
         match self {
             SourceConfidence::Exact => source_app.to_string(),
-            SourceConfidence::Likely => format!("{source_app} (fg?)"),
+            SourceConfidence::Likely => format!("{source_app}（疑似）"),
             SourceConfidence::Unknown => {
                 if source_app == "unknown" {
-                    source_app.to_string()
+                    "未知来源".to_string()
                 } else {
-                    format!("{source_app} (?)")
+                    format!("{source_app}（不确定）")
                 }
             }
         }
@@ -39,10 +39,8 @@ impl SourceConfidence {
     pub fn hint(self) -> &'static str {
         match self {
             SourceConfidence::Exact => "",
-            SourceConfidence::Likely => {
-                "Source inferred from foreground application. Clipboard owner was unavailable."
-            }
-            SourceConfidence::Unknown => "Source could not be attributed.",
+            SourceConfidence::Likely => "来源根据前台应用推断，剪贴板所有者不可用。",
+            SourceConfidence::Unknown => "无法确定来源应用。",
         }
     }
 }
@@ -63,9 +61,7 @@ impl PasteConfidence {
 
     pub fn detail_copy(self) -> &'static str {
         match self {
-            PasteConfidence::HotkeyObserved => {
-                "Paste trigger detected — insertion not verified"
-            }
+            PasteConfidence::HotkeyObserved => "检测到粘贴触发 — 未验证是否已插入目标应用",
         }
     }
 }
@@ -86,11 +82,11 @@ impl PasteMethod {
     }
 }
 
-/// New CF_UNICODETEXT on the clipboard (enriched by the platform layer).
+/// One supported clipboard payload (enriched by the platform layer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardChange {
     pub sequence: u32,
-    pub text: String,
+    pub payload: crate::model::ClipboardPayload,
     pub content_hash: String,
     pub source_pid: u32,
     pub source_exe: String,
@@ -114,6 +110,8 @@ pub struct PasteTrigger {
 /// Token for a Veya-initiated clipboard write (user re-copied from the UI).
 ///
 /// Suppress only the matching write; never ignore all `source == veya` traffic.
+/// `expected_sequence: None` means the next event with the same content hash;
+/// the token expires when a different clipboard event arrives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InternalClipboardWrite {
     pub expected_sequence: Option<u32>,

@@ -32,7 +32,10 @@ pub fn match_field<'a>(
     if source_app.to_lowercase().contains(&q) {
         return Some(MatchField::SourceApp);
     }
-    if target_apps.into_iter().any(|t| t.to_lowercase().contains(&q)) {
+    if target_apps
+        .into_iter()
+        .any(|t| t.to_lowercase().contains(&q))
+    {
         return Some(MatchField::TargetApp);
     }
     None
@@ -51,10 +54,7 @@ pub fn search<'a>(
                 record.pastes.iter().map(|p| p.target_app.as_str()),
                 query,
             )?;
-            Some(SearchHit {
-                record,
-                matched_on,
-            })
+            Some(SearchHit { record, matched_on })
         })
         .collect()
 }

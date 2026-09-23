@@ -1,0 +1,48 @@
+Unicode True
+Name "Veya"
+OutFile "..\artifacts\veya-setup.exe"
+InstallDir "$PROGRAMFILES64\Veya"
+InstallDirRegKey HKLM "Software\Veya" "InstallLocation"
+RequestExecutionLevel admin
+
+!include "MUI2.nsh"
+!define MUI_ICON "..\icons\icon.ico"
+!define MUI_ABORTWARNING
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "SimpChinese"
+
+; Stop the old process only after the user starts installation. Overwrite it in
+; place; running an old uninstaller here could remove the new install's files.
+Section "Veya" SEC_MAIN
+  SectionIn RO
+  ExecWait '"$SYSDIR\taskkill.exe" /F /IM veya.exe'
+  Sleep 300
+  SetOutPath "$INSTDIR"
+  File /oname=veya.exe "${APP_BINARY}"
+  WriteUninstaller "$INSTDIR\uninstall.exe"
+  WriteRegStr HKLM "Software\Veya" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "DisplayName" "Veya"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "DisplayVersion" "${APP_VERSION}"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "UninstallString" '"$INSTDIR\uninstall.exe"'
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "NoModify" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya" "NoRepair" 1
+  CreateDirectory "$SMPROGRAMS\Veya"
+  CreateShortcut "$SMPROGRAMS\Veya\Veya.lnk" "$INSTDIR\veya.exe" "" "$INSTDIR\veya.exe" 0
+SectionEnd
+
+Section "Uninstall"
+  Delete "$SMPROGRAMS\Veya\Veya.lnk"
+  RMDir "$SMPROGRAMS\Veya"
+  Delete "$INSTDIR\veya.exe"
+  Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Veya"
+  DeleteRegKey HKLM "Software\Veya"
+  ; Clipboard history and settings in %APPDATA%\Veya are user data.
+SectionEnd

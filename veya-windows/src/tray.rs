@@ -53,20 +53,177 @@ fn set_paused_impl(paused: bool) {
 #[cfg(windows)]
 pub fn spawn(tx: Sender<TrayEvent>) -> Result<(), String> {
     *TX.lock().unwrap() = Some(tx);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("veya-tray".into())
         .spawn(move || {
-            if let Err(e) = run_tray() {
+            if let Err(e) = run_tray(&ready_tx) {
+                let _ = ready_tx.send(Err(e.clone()));
                 eprintln!("tray: {e}");
             }
+            *TX.lock().unwrap() = None;
+            TRAY_HWND.store(0, Ordering::SeqCst);
         })
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("tray startup status unavailable: {e}"))?
 }
 
 #[cfg(not(windows))]
 pub fn spawn(_tx: Sender<TrayEvent>) -> Result<(), String> {
     Err("tray is Windows-only".into())
+}
+
+/// Create a tray HICON from exact RGBA pixels (Kite-style 32×32).
+/// Do not let the shell resample a larger icon — that is what made the
+/// tray glyph look softer/different from Kite.
+#[cfg(windows)]
+fn create_hicon_from_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    use std::ptr;
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Gdi::{
+        CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+    if rgba.len() != (width * height * 4) as usize {
+        return None;
+    }
+
+    // Windows DIBs are BGRA top-down.
+    let mut bgra = rgba.to_vec();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+
+    unsafe {
+        let hdc = GetDC(None);
+        let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0 as u32,
+                biSizeImage: (width * height * 4) as u32,
+                ..Default::default()
+            },
+            bmiColors: [Default::default()],
+        };
+        let color = match CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bmp) => bmp,
+            Err(_) => {
+                let _ = ReleaseDC(None, hdc);
+                return None;
+            }
+        };
+        if bits.is_null() {
+            let _ = DeleteObject(color.into());
+            let _ = ReleaseDC(None, hdc);
+            return None;
+        }
+        ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+
+        // 32bpp + alpha: mask is unused but CreateIconIndirect requires one.
+        let mask = CreateBitmap(width as i32, height as i32, 1, 1, None);
+        if mask.is_invalid() {
+            let _ = DeleteObject(color.into());
+            let _ = ReleaseDC(None, hdc);
+            return None;
+        }
+
+        let icon_info = ICONINFO {
+            fIcon: BOOL(1),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let hicon = CreateIconIndirect(&icon_info).ok();
+        let _ = DeleteObject(mask.into());
+        let _ = DeleteObject(color.into());
+        let _ = ReleaseDC(None, hdc);
+        hicon.filter(|h| !h.is_invalid())
+    }
+}
+
+/// Product logo at tray-native 32×32. The source artwork has transparent
+/// padding, so crop that padding before downsampling to the shell icon size.
+#[cfg(windows)]
+fn product_icon() -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    create_hicon_from_rgba(&tray_pixels()?, 32, 32)
+}
+
+#[cfg(windows)]
+fn tray_pixels() -> Option<Vec<u8>> {
+    use image::imageops::{crop_imm, overlay, resize, FilterType};
+    use image::RgbaImage;
+
+    let source = image::load_from_memory(include_bytes!("../../icons/256x256.png"))
+        .ok()?
+        .to_rgba8();
+    let mut min_x = source.width();
+    let mut min_y = source.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for (x, y, pixel) in source.enumerate_pixels() {
+        if pixel[3] >= 32 {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+    let crop_width = max_x - min_x + 1;
+    let crop_height = max_y - min_y + 1;
+    let cropped = crop_imm(&source, min_x, min_y, crop_width, crop_height).to_image();
+    let scale = 32.0 / crop_width.max(crop_height) as f32;
+    let width = ((crop_width as f32 * scale).round() as u32).clamp(1, 32);
+    let height = ((crop_height as f32 * scale).round() as u32).clamp(1, 32);
+    let scaled = resize(&cropped, width, height, FilterType::Lanczos3);
+    let mut canvas = RgbaImage::new(32, 32);
+    overlay(
+        &mut canvas,
+        &scaled,
+        ((32 - width) / 2) as i64,
+        ((32 - height) / 2) as i64,
+    );
+    Some(canvas.into_raw())
+}
+
+#[cfg(windows)]
+fn load_app_icon() -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    product_icon().or_else(|| {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, HICON, IMAGE_ICON};
+
+        let module = unsafe { GetModuleHandleW(None) }.ok()?;
+        // Fallback: exe RT_GROUP_ICON at exact 32×32 (no LR_DEFAULTSIZE resample).
+        let img = unsafe {
+            LoadImageW(
+                Some(module.into()),
+                PCWSTR(1 as *const u16),
+                IMAGE_ICON,
+                32,
+                32,
+                Default::default(),
+            )
+            .ok()?
+        };
+        Some(HICON(img.0))
+    })
 }
 
 #[cfg(windows)]
@@ -79,7 +236,7 @@ fn send(cmd: TrayEvent) {
 }
 
 #[cfg(windows)]
-fn run_tray() -> Result<(), String> {
+fn run_tray(ready: &Sender<Result<(), String>>) -> Result<(), String> {
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::HBRUSH;
@@ -112,7 +269,7 @@ fn run_tray() -> Result<(), String> {
 
     fn tip_for(paused: bool) -> [u16; 128] {
         let src: Vec<u16> = if paused {
-            "Veya (paused)\0".encode_utf16().collect()
+            "Veya（已暂停）\0".encode_utf16().collect()
         } else {
             "Veya\0".encode_utf16().collect()
         };
@@ -207,20 +364,44 @@ fn run_tray() -> Result<(), String> {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
-        let open: Vec<u16> = "Open Veya\0".encode_utf16().collect();
-        let p10: Vec<u16> = "Pause for 10 minutes\0".encode_utf16().collect();
+        let open: Vec<u16> = "打开 Veya\0".encode_utf16().collect();
+        let p10: Vec<u16> = "暂停 10 分钟\0".encode_utf16().collect();
         let pause: Vec<u16> = if PAUSED.load(Ordering::SeqCst) {
-            "Resume tracking\0".encode_utf16().collect()
+            "恢复记录\0".encode_utf16().collect()
         } else {
-            "Pause tracking\0".encode_utf16().collect()
+            "暂停记录\0".encode_utf16().collect()
         };
-        let clear: Vec<u16> = "Clear history\0".encode_utf16().collect();
-        let settings: Vec<u16> = "Settings\0".encode_utf16().collect();
-        let exit: Vec<u16> = "Exit\0".encode_utf16().collect();
-        let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, ID_OPEN, PCWSTR(open.as_ptr()));
-        let _ = InsertMenuW(menu, 1, MF_BYPOSITION | MF_STRING, ID_PAUSE10, PCWSTR(p10.as_ptr()));
-        let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_STRING, ID_PAUSE, PCWSTR(pause.as_ptr()));
-        let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_STRING, ID_CLEAR, PCWSTR(clear.as_ptr()));
+        let clear: Vec<u16> = "清空历史\0".encode_utf16().collect();
+        let settings: Vec<u16> = "设置\0".encode_utf16().collect();
+        let exit: Vec<u16> = "退出\0".encode_utf16().collect();
+        let _ = InsertMenuW(
+            menu,
+            0,
+            MF_BYPOSITION | MF_STRING,
+            ID_OPEN,
+            PCWSTR(open.as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            1,
+            MF_BYPOSITION | MF_STRING,
+            ID_PAUSE10,
+            PCWSTR(p10.as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            2,
+            MF_BYPOSITION | MF_STRING,
+            ID_PAUSE,
+            PCWSTR(pause.as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            3,
+            MF_BYPOSITION | MF_STRING,
+            ID_CLEAR,
+            PCWSTR(clear.as_ptr()),
+        );
         let _ = InsertMenuW(
             menu,
             4,
@@ -228,7 +409,13 @@ fn run_tray() -> Result<(), String> {
             ID_SETTINGS,
             PCWSTR(settings.as_ptr()),
         );
-        let _ = InsertMenuW(menu, 5, MF_BYPOSITION | MF_STRING, ID_EXIT, PCWSTR(exit.as_ptr()));
+        let _ = InsertMenuW(
+            menu,
+            5,
+            MF_BYPOSITION | MF_STRING,
+            ID_EXIT,
+            PCWSTR(exit.as_ptr()),
+        );
 
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -279,7 +466,11 @@ fn run_tray() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-        let tracking = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        // Prefer the embedded app icon (winres / icons/icon.ico) over the generic
+        // stock IDI_APPLICATION glyph so the tray matches the product logo.
+        let tracking = load_app_icon()
+            .or_else(|| LoadIconW(None, IDI_APPLICATION).ok())
+            .unwrap_or_default();
         let paused_icon = LoadIconW(None, IDI_WARNING).unwrap_or(tracking);
         ICON_TRACKING.store(tracking.0 as isize, Ordering::SeqCst);
         ICON_PAUSED.store(paused_icon.0 as isize, Ordering::SeqCst);
@@ -299,6 +490,7 @@ fn run_tray() -> Result<(), String> {
             return Err("Shell_NotifyIconW NIM_ADD failed".into());
         }
         TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        let _ = ready.send(Ok(()));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 != 0 {
@@ -311,4 +503,56 @@ fn run_tray() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod icon_tests {
+    use super::{product_icon, tray_pixels};
+
+    #[test]
+    fn visible_tray_artwork_fills_native_canvas() {
+        let rgba = tray_pixels().expect("tray icon pixels");
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+        let visible: Vec<(usize, usize)> = (0..32 * 32)
+            .filter(|&pixel| rgba[pixel * 4 + 3] >= 128)
+            .map(|pixel| (pixel % 32, pixel / 32))
+            .collect();
+        let min_x = visible.iter().map(|&(x, _)| x).min().unwrap();
+        let max_x = visible.iter().map(|&(x, _)| x).max().unwrap();
+        let min_y = visible.iter().map(|&(_, y)| y).min().unwrap();
+        let max_y = visible.iter().map(|&(_, y)| y).max().unwrap();
+        assert!(max_x - min_x + 1 >= 30, "tray logo is too narrow");
+        assert!(max_y - min_y + 1 >= 30, "tray logo is too short");
+    }
+
+    #[test]
+    fn win32_tray_icon_has_native_dimensions() {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP, HGDIOBJ};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+
+        let icon = product_icon().expect("CreateIconIndirect should accept tray pixels");
+        let mut info = ICONINFO::default();
+        unsafe {
+            let got_info = GetIconInfo(icon, &mut info);
+            let mut bitmap = BITMAP::default();
+            let got_bitmap = if got_info.is_ok() {
+                GetObjectW(
+                    HGDIOBJ(info.hbmColor.0),
+                    std::mem::size_of::<BITMAP>() as i32,
+                    Some(&mut bitmap as *mut BITMAP as *mut _),
+                )
+            } else {
+                0
+            };
+            if !info.hbmColor.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+            }
+            if !info.hbmMask.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+            }
+            let _ = DestroyIcon(icon);
+            assert!(got_bitmap > 0, "GetIconInfo/GetObjectW failed");
+            assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (32, 32));
+        }
+    }
 }
