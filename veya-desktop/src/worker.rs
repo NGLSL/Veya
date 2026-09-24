@@ -1,17 +1,25 @@
 //! Capture worker: platform events → enrich → FlowEngine → SQLite + UI snapshot.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
 use veya_core::{
-    payload_hash, ClipboardPayload, FlowEngine, InternalClipboardWrite, PasteConfidence,
+    aggregate, payload_hash, ClipboardPayload, ClipboardRecord, FlowEngine, InternalClipboardWrite,
+    PasteConfidence,
 };
 use veya_storage::Store;
 use veya_windows::hotkey::Hotkey;
 use veya_windows::platform::{enrich_clipboard, enrich_paste, PlatformEvent, WindowSignal};
 use veya_windows::write_payload;
 
-use crate::capture::{snapshot_from_flow, Retention, SharedUi};
-use crate::format::now_ms;
+use crate::capture::{
+    card_view_with_cached_image, CardPayloadView, CardView, HistoryQuery, Retention, SharedUi,
+    UiState,
+};
+use crate::format::{self, now_ms};
+
+const HISTORY_PAGE_SIZE: usize = 25;
+const HISTORY_READ_BATCH: usize = 16;
 
 pub enum WorkerCmd {
     Recopy { sequence: u32 },
@@ -25,6 +33,10 @@ pub enum WorkerCmd {
     SetPinned { sequences: Vec<u32>, pinned: bool },
     SetExpandedRaw(bool),
     SetHotkey(Hotkey),
+    QueryHistory(HistoryQuery),
+    SetHistoryActive(bool),
+    LoadFullImage(u32),
+    UnloadFullImage,
 }
 
 pub struct WorkerHandle {
@@ -72,17 +84,114 @@ fn write_internal_payload(
     }
 }
 
-fn load_into_flow(store: &Store, flow: &mut FlowEngine) {
-    if let Ok(existing) = store.load_all() {
-        for rec in existing {
-            flow.restore_record(rec);
+fn same_history_group(left: &ClipboardRecord, right: &ClipboardRecord) -> bool {
+    left.content_hash == right.content_hash
+        && left.pinned == right.pinned
+        && left.source_app == right.source_app
+        && left.created_at_ms.abs_diff(right.created_at_ms)
+            <= aggregate::AGGREGATION_WINDOW_MS as u64
+}
+
+fn load_history_page(
+    store: &Store,
+    query: &HistoryQuery,
+    cached_images: &HashMap<u32, iced::widget::image::Handle>,
+) -> Result<(Vec<CardView>, bool), String> {
+    let mut cursor = None;
+    let mut group = Vec::<ClipboardRecord>::new();
+    let mut cards = Vec::with_capacity(HISTORY_PAGE_SIZE);
+    let mut matched = 0usize;
+    let skip = query.page.saturating_mul(HISTORY_PAGE_SIZE);
+    let now = now_ms();
+
+    let mut finish_group = |group: &mut Vec<ClipboardRecord>| -> bool {
+        if group.is_empty() {
+            return false;
+        }
+        let aggregated = aggregate::history_cards(group.iter());
+        let card = &aggregated[0];
+        let matches = query.filter.matches(format::payload_kind(card.payload))
+            && (!query.pinned_only || card.pinned)
+            && veya_core::match_field(
+                card.content,
+                card.source_app,
+                card.used_in
+                    .iter()
+                    .map(|use_record| use_record.target_app.as_str()),
+                &query.search,
+            )
+            .is_some();
+        if matches {
+            if matched >= skip.saturating_add(HISTORY_PAGE_SIZE) {
+                return true;
+            }
+            if matched >= skip {
+                cards.push(card_view_with_cached_image(
+                    card,
+                    now,
+                    cached_images.get(&card.representative_sequence),
+                ));
+            }
+            matched += 1;
+        }
+        group.clear();
+        false
+    };
+
+    loop {
+        let batch = store
+            .load_records_page(cursor, HISTORY_READ_BATCH, query.newest_first)
+            .map_err(|error| format!("读取历史失败：{error}"))?;
+        if batch.is_empty() {
+            break;
+        }
+        let count = batch.len();
+        for record in batch {
+            cursor = Some((record.created_at_ms, record.sequence));
+            if group
+                .last()
+                .is_some_and(|last| !same_history_group(last, &record))
+                && finish_group(&mut group)
+            {
+                return Ok((cards, true));
+            }
+            group.push(record);
+        }
+        if count < HISTORY_READ_BATCH {
+            break;
+        }
+    }
+    let has_next = finish_group(&mut group);
+    Ok((cards, has_next))
+}
+
+fn discard_inactive_records(flow: &mut FlowEngine, keep: Option<u32>) {
+    let stale: Vec<_> = flow
+        .records()
+        .map(|record| record.sequence)
+        .filter(|sequence| Some(*sequence) != keep)
+        .collect();
+    for sequence in stale {
+        flow.delete_record(sequence);
+    }
+}
+
+fn discard_purged_record(store: &Store, flow: &mut FlowEngine) {
+    let current = flow.records().next().map(|record| record.sequence);
+    if let Some(sequence) = current {
+        if matches!(store.load_record(sequence), Ok(None)) {
+            flow.delete_record(sequence);
         }
     }
 }
 
 fn publish(
     shared: &SharedUi,
+    store: &Store,
     flow: &FlowEngine,
+    history_query: &HistoryQuery,
+    history_active: bool,
+    modal_image: &Option<(u32, iced::widget::image::Handle)>,
     tracking: bool,
     tracking_ack: u64,
     retention: Retention,
@@ -93,19 +202,50 @@ fn publish(
     hotkey_active: Hotkey,
     hotkey_error: Option<String>,
 ) {
-    let mut snap = snapshot_from_flow(
-        flow,
+    let (cards, history_has_next, status_note) = if history_active {
+        let cached_images = shared
+            .lock()
+            .map(|guard| {
+                guard
+                    .cards
+                    .iter()
+                    .filter_map(|card| match &card.payload {
+                        CardPayloadView::Image { handle, .. } => {
+                            Some((card.sequence, handle.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match load_history_page(store, history_query, &cached_images) {
+            Ok((cards, has_next)) => (cards, has_next, status_note),
+            Err(error) => (Vec::new(), false, error),
+        }
+    } else {
+        (Vec::new(), false, status_note)
+    };
+    let mut snap = UiState {
+        revision: 0,
+        cards,
+        history_query: history_query.clone(),
+        history_active,
+        history_has_next,
+        modal_image: modal_image.clone(),
+        selected: None,
+        record_count: store.count_records().unwrap_or(flow.len()),
         retention,
         tracking,
+        tracking_ack,
         excluded_apps,
         expanded_raw,
         status_note,
-    );
-    snap.tracking_ack = tracking_ack;
-    snap.hotkey_selected = hotkey_selected;
-    snap.hotkey_active = hotkey_active;
-    snap.hotkey_error = hotkey_error;
+        hotkey_selected,
+        hotkey_active,
+        hotkey_error,
+    };
     if let Ok(mut guard) = shared.lock() {
+        snap.revision = guard.revision.wrapping_add(1);
         snap.selected = guard.selected;
         *guard = snap;
     }
@@ -184,7 +324,9 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
         }
         let mut store = Store::open(&store_path).expect("open sqlite store");
         let mut flow = FlowEngine::new();
-        load_into_flow(&store, &mut flow);
+        let mut history_query = HistoryQuery::default();
+        let mut history_active = false;
+        let mut modal_image = None;
         let mut tracking = true;
         let mut tracking_ack = 0;
         let mut retention = store
@@ -210,7 +352,11 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
 
         publish(
             &shared,
+            &store,
             &flow,
+            &history_query,
+            history_active,
+            &modal_image,
             tracking,
             tracking_ack,
             retention,
@@ -237,7 +383,16 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                 dirty = true;
                 match cmd {
                     WorkerCmd::Recopy { sequence } => {
-                        let payload = flow.record(sequence).map(|record| record.payload.clone());
+                        let payload = flow
+                            .record(sequence)
+                            .map(|record| record.payload.clone())
+                            .or_else(|| {
+                                store
+                                    .load_record(sequence)
+                                    .ok()
+                                    .flatten()
+                                    .map(|record| record.payload)
+                            });
                         status_note = match payload {
                             Some(payload) => {
                                 match write_internal_payload(&mut flow, &payload, write_payload) {
@@ -260,6 +415,8 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                         status_note = match store.clear() {
                             Ok(()) => {
                                 flow.clear();
+                                modal_image = None;
+                                history_query.page = 0;
                                 "历史已清空".into()
                             }
                             Err(error) => format!("清空历史失败：{error}"),
@@ -282,8 +439,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                         let _ = store.set_setting("retention", r.as_key());
                         if let Some(cutoff) = retention.cutoff_ms(now_ms()) {
                             let _ = store.purge_older_than(cutoff);
-                            flow.clear();
-                            load_into_flow(&store, &mut flow);
+                            discard_purged_record(&store, &mut flow);
                         }
                         status_note = format!("保留期已设为 {}", r.label());
                     }
@@ -300,6 +456,12 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                         };
                     }
                     WorkerCmd::DeleteRecord { sequences } => {
+                        if modal_image
+                            .as_ref()
+                            .is_some_and(|(sequence, _)| sequences.contains(sequence))
+                        {
+                            modal_image = None;
+                        }
                         status_note = match store.delete_records(&sequences) {
                             Ok(_) => {
                                 for sequence in sequences {
@@ -327,6 +489,32 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                     WorkerCmd::SetExpandedRaw(on) => {
                         expanded_raw = on;
                     }
+                    WorkerCmd::QueryHistory(query) => {
+                        history_query = query;
+                    }
+                    WorkerCmd::SetHistoryActive(active) => {
+                        history_active = active;
+                        if !active {
+                            modal_image = None;
+                        }
+                    }
+                    WorkerCmd::LoadFullImage(sequence) => {
+                        modal_image =
+                            store
+                                .load_record(sequence)
+                                .ok()
+                                .flatten()
+                                .and_then(|record| match record.payload {
+                                    ClipboardPayload::Image { png, .. } => Some((
+                                        sequence,
+                                        iced::widget::image::Handle::from_bytes(png),
+                                    )),
+                                    _ => None,
+                                });
+                    }
+                    WorkerCmd::UnloadFullImage => {
+                        modal_image = None;
+                    }
                     WorkerCmd::SetHotkey(selection) => {
                         if !veya_windows::platform::request_hotkey_change(selection) {
                             hotkey_error = Some("快捷键服务尚未就绪，请稍后重试".into());
@@ -343,14 +531,33 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                 if let Some(cutoff) = retention.cutoff_ms(now) {
                     let removed = store.purge_older_than(cutoff).unwrap_or(0);
                     if removed > 0 {
-                        flow.clear();
-                        load_into_flow(&store, &mut flow);
+                        discard_purged_record(&store, &mut flow);
                         dirty = true;
                     }
                 }
             }
 
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            if dirty {
+                publish(
+                    &shared,
+                    &store,
+                    &flow,
+                    &history_query,
+                    history_active,
+                    &modal_image,
+                    tracking,
+                    tracking_ack,
+                    retention,
+                    excluded_apps.clone(),
+                    expanded_raw,
+                    status_note.clone(),
+                    hotkey_selected,
+                    hotkey_active,
+                    hotkey_error.clone(),
+                );
+            }
+
+            let event_received = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(ev) => {
                     match ev {
                         PlatformEvent::ToggleWindow { visible } => {
@@ -392,6 +599,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                                 Some(change) => {
                                     if is_excluded_source(&excluded_apps, &change.source_exe) {
                                         flow.on_untracked_clipboard_change(change.sequence);
+                                        discard_inactive_records(&mut flow, None);
                                     } else {
                                         let seq = change.sequence;
                                         let outcome = flow.on_clipboard_change(change);
@@ -406,16 +614,19 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                                                 }
                                             }
                                         }
+                                        discard_inactive_records(&mut flow, Some(seq));
                                     }
                                 }
                                 None => {
                                     flow.on_untracked_clipboard_change(sequence);
+                                    discard_inactive_records(&mut flow, None);
                                     status_note = "剪贴板内容无法读取或超出大小上限，已跳过".into();
                                 }
                             }
                         }
                         PlatformEvent::ClipboardSkipped { sequence } if tracking => {
                             flow.on_untracked_clipboard_change(sequence);
+                            discard_inactive_records(&mut flow, None);
                             status_note = "该剪贴板格式暂不支持或无法读取，已跳过".into();
                         }
                         PlatformEvent::PasteTrigger(raw) if tracking => {
@@ -431,16 +642,20 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                         }
                         _ => {}
                     }
-                    dirty = true;
+                    true
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+            };
 
-            if dirty {
+            if event_received {
                 publish(
                     &shared,
+                    &store,
                     &flow,
+                    &history_query,
+                    history_active,
+                    &modal_image,
                     tracking,
                     tracking_ack,
                     retention,
@@ -462,7 +677,205 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veya_core::{ClipboardChange, FlowOutcome, SourceConfidence};
+    use crate::capture::HistoryFilter;
+    use veya_core::{
+        ClipboardChange, FlowOutcome, PasteConfidence, PasteMethod, PasteTriggerRecord,
+        SourceConfidence,
+    };
+
+    fn text_record(sequence: u32, text: &str, created_at_ms: i64) -> ClipboardRecord {
+        let payload = ClipboardPayload::Text(text.to_string());
+        ClipboardRecord {
+            sequence,
+            content_type: "text".into(),
+            content: text.into(),
+            content_hash: payload_hash(&payload),
+            payload,
+            source_app: "test.exe".into(),
+            source_pid: 1,
+            source_window: String::new(),
+            source_confidence: SourceConfidence::Exact,
+            created_at_ms,
+            pinned: false,
+            pastes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn history_paging_searches_all_records_without_retaining_all_cards() {
+        let mut store = Store::open_in_memory().unwrap();
+        for sequence in 1..=30 {
+            store
+                .insert_record(&text_record(
+                    sequence,
+                    &format!("entry-{sequence:02}-X"),
+                    i64::from(sequence) * 10_000,
+                ))
+                .unwrap();
+        }
+
+        let mut query = HistoryQuery::default();
+        let (first, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        assert_eq!(first.len(), HISTORY_PAGE_SIZE);
+        assert_eq!(first.first().unwrap().sequence, 30);
+        assert_eq!(first.last().unwrap().sequence, 6);
+        assert!(has_next);
+
+        query.page = 1;
+        let (second, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        assert_eq!(second.len(), 5);
+        assert_eq!(second.first().unwrap().sequence, 5);
+        assert_eq!(second.last().unwrap().sequence, 1);
+        assert!(!has_next);
+
+        query.page = 0;
+        query.search = "entry-03-X".into();
+        let (matches, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].sequence, 3);
+        assert!(!has_next);
+
+        query.search.clear();
+        query.newest_first = false;
+        let (oldest, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        assert_eq!(oldest.first().unwrap().sequence, 1);
+        assert_eq!(oldest.last().unwrap().sequence, 25);
+        assert!(has_next);
+    }
+
+    #[test]
+    fn inactive_history_releases_the_published_page() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .insert_record(&text_record(1, "saved", 10_000))
+            .unwrap();
+        let shared = SharedUi::default();
+        let flow = FlowEngine::new();
+        let query = HistoryQuery::default();
+        let publish_with_active = |active| {
+            publish(
+                &shared,
+                &store,
+                &flow,
+                &query,
+                active,
+                &None,
+                true,
+                0,
+                Retention::default(),
+                Vec::new(),
+                false,
+                String::new(),
+                Hotkey::default(),
+                Hotkey::default(),
+                None,
+            );
+        };
+
+        publish_with_active(true);
+        assert_eq!(shared.lock().unwrap().cards.len(), 1);
+        publish_with_active(false);
+        let snap = shared.lock().unwrap();
+        assert!(!snap.history_active);
+        assert!(snap.cards.is_empty());
+        assert_eq!(snap.record_count, 1);
+    }
+
+    #[test]
+    fn history_group_survives_storage_batch_boundary() {
+        let mut store = Store::open_in_memory().unwrap();
+        for sequence in 1..=18 {
+            let grouped = (2..=4).contains(&sequence);
+            let mut record = text_record(
+                sequence,
+                if grouped { "repeated" } else { "other" },
+                if grouped {
+                    20_000 + i64::from(sequence) * 100
+                } else {
+                    i64::from(sequence) * 10_000
+                },
+            );
+            if !grouped {
+                record.content_hash = format!("unique-{sequence}");
+            }
+            store.insert_record(&record).unwrap();
+        }
+
+        let (cards, has_next) =
+            load_history_page(&store, &HistoryQuery::default(), &HashMap::new()).unwrap();
+        let grouped = cards.iter().find(|card| card.sequence == 2).unwrap();
+        assert_eq!(grouped.raw_count, 3);
+        assert_eq!(grouped.raw_sequences, vec![2, 3, 4]);
+        assert!(!has_next);
+    }
+
+    #[test]
+    fn history_filters_use_payload_kind_pin_and_paste_target_across_storage() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut link = text_record(1, "https://example.com", 10_000);
+        link.pastes.push(PasteTriggerRecord {
+            target_app: "target-app.exe".into(),
+            target_pid: 2,
+            target_window: String::new(),
+            method: PasteMethod::CtrlV,
+            confidence: PasteConfidence::HotkeyObserved,
+            triggered_at_ms: 11_000,
+        });
+        let mut code = text_record(2, "SELECT * FROM notes", 20_000);
+        code.pinned = true;
+        let path_text = text_record(3, r"C:\Pictures\image.png", 30_000);
+        let mut files = text_record(4, "", 40_000);
+        files.payload = ClipboardPayload::Files(vec![r"C:\Pictures\image.png".into()]);
+        files.content_hash = payload_hash(&files.payload);
+        let mut image = text_record(5, "", 50_000);
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+        image.payload = ClipboardPayload::Image {
+            png,
+            width: 1,
+            height: 1,
+        };
+        image.content_hash = payload_hash(&image.payload);
+        for record in [&link, &code, &path_text, &files, &image] {
+            store.insert_record(record).unwrap();
+        }
+
+        let mut query = HistoryQuery::default();
+        for (filter, expected) in [
+            (HistoryFilter::Link, 1),
+            (HistoryFilter::Code, 2),
+            (HistoryFilter::Text, 3),
+            (HistoryFilter::File, 4),
+            (HistoryFilter::Image, 5),
+        ] {
+            query.filter = filter;
+            let (cards, _) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+            assert_eq!(
+                cards.iter().map(|card| card.sequence).collect::<Vec<_>>(),
+                [expected]
+            );
+        }
+        query.filter = HistoryFilter::All;
+        query.pinned_only = true;
+        let (cards, _) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        assert_eq!(
+            cards.iter().map(|card| card.sequence).collect::<Vec<_>>(),
+            [2]
+        );
+        query.pinned_only = false;
+        query.search = "target-app".into();
+        let (cards, _) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        assert_eq!(
+            cards.iter().map(|card| card.sequence).collect::<Vec<_>>(),
+            [1]
+        );
+    }
 
     #[test]
     fn excluded_app_matches_win32_exe_name_regardless_of_case() {

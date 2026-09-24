@@ -94,9 +94,10 @@ impl App {
 
     pub(super) fn history_column(&self) -> Element<'_, Message> {
         let filtered = self.filtered_cards();
-        if filtered.is_empty() {
-            let searching = !self.search.trim().is_empty();
-            let (icon, title, sub) = if searching {
+        let content: Element<'_, Message> = if filtered.is_empty() {
+            let (icon, title, sub) = if self.history_query_pending() {
+                (Icon::History, "正在加载历史记录", "正在读取当前筛选结果…")
+            } else if !self.search.trim().is_empty() {
                 (
                     Icon::Search,
                     "没有匹配结果",
@@ -142,7 +143,7 @@ impl App {
                     "复制点东西，Veya 会在这里记住它们。",
                 )
             };
-            return container(
+            container(
                 column![
                     icons::icon(icon, theme::FAINT, 28.0),
                     Space::with_height(10.0),
@@ -156,44 +157,97 @@ impl App {
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .into();
-        }
-
-        // Clean seamless stream without intrusive date headers matching Fig 1
-        let spacing = if self.list_density == ListDensity::Compact {
-            2
+            .into()
         } else {
-            6
-        };
-        let mut list = column![].spacing(spacing).padding(pad(6.0, 4.0, 6.0, 2.0));
-        for card in &filtered {
-            list = list.push(self.card_widget(card));
-        }
+            // Clean seamless stream without intrusive date headers matching Fig 1
+            let spacing = if self.list_density == ListDensity::Compact {
+                2
+            } else {
+                6
+            };
+            let mut list = column![].spacing(spacing).padding(pad(6.0, 4.0, 6.0, 2.0));
+            for card in &filtered {
+                list = list.push(self.card_widget(card));
+            }
 
-        column![scrollable(list)
-            .id(history_scroll_id())
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                iced::widget::scrollable::Scrollbar::new()
-                    .width(4)
-                    .scroller_width(4)
-                    .margin(2),
-            ))
-            .style(theme::scroll_style)
-            .height(Length::Fill)]
-        .spacing(0)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+            scrollable(list)
+                .id(history_scroll_id())
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    iced::widget::scrollable::Scrollbar::new()
+                        .width(4)
+                        .scroller_width(4)
+                        .margin(2),
+                ))
+                .style(theme::scroll_style)
+                .height(Length::Fill)
+                .into()
+        };
+
+        column![content, self.history_pagination()]
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     pub(super) fn filtered_cards(&self) -> Vec<&CardView> {
-        visible_cards(
-            &self.state.cards,
-            self.filter,
-            self.pinned_only,
-            self.sort_order,
-            &self.search,
+        // The worker owns filtering, sorting, and paging. The UI only receives
+        // the bounded page, so never rebuild a second full history projection
+        // here.
+        self.state.cards.iter().collect()
+    }
+
+    fn history_pagination(&self) -> Element<'_, Message> {
+        let page = self.history_page;
+        let pending = self.history_query_pending();
+        if self.state.cards.is_empty() && page == 0 && !self.state.history_has_next && !pending {
+            return Space::with_height(0.0).into();
+        }
+
+        let previous_color = if page > 0 && !pending {
+            theme::MUTED
+        } else {
+            theme::FAINT
+        };
+        let next_color = if self.state.history_has_next && !pending {
+            theme::MUTED
+        } else {
+            theme::FAINT
+        };
+
+        let mut previous = button(text("上一页").size(12).color(previous_color))
+            .padding(pad(5.0, 10.0, 5.0, 10.0))
+            .style(theme::action_button);
+        if page > 0 && !pending {
+            previous = previous.on_press(Message::PreviousHistoryPage);
+        }
+
+        let mut next = button(text("下一页").size(12).color(next_color))
+            .padding(pad(5.0, 10.0, 5.0, 10.0))
+            .style(theme::action_button);
+        if self.state.history_has_next && !pending {
+            next = next.on_press(Message::NextHistoryPage);
+        }
+
+        container(
+            row![
+                previous,
+                meta(if pending {
+                    "正在加载…".to_string()
+                } else {
+                    format!("第 {} 页 · 每页 25 条", page + 1)
+                })
+                .size(11)
+                .color(theme::FAINT),
+                next,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         )
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding(pad(6.0, 4.0, 2.0, 4.0))
+        .into()
     }
 
     pub(super) fn ensure_visible_selection(&mut self) {
@@ -205,7 +259,7 @@ impl App {
         if current != next {
             self.state.selected = next;
             self.detail_menu_open = false;
-            self.content_modal_for = None;
+            self.unload_full_image();
             self.show_qrcode = false;
         }
     }

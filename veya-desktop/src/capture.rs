@@ -2,7 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use veya_core::{ClipboardPayload, FlowEngine, HistoryCard, PasteConfidence, SourceConfidence};
+use image::ImageFormat;
+use veya_core::{ClipboardPayload, HistoryCard, PasteConfidence, SourceConfidence};
 use veya_windows::hotkey::Hotkey;
 
 use crate::format::{self, ContentKind};
@@ -27,6 +28,51 @@ pub enum CardPayloadView {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryFilter {
+    #[default]
+    All,
+    Text,
+    Link,
+    Code,
+    File,
+    Image,
+}
+
+impl HistoryFilter {
+    pub fn matches(self, kind: ContentKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Text => kind == ContentKind::Text,
+            Self::Link => kind == ContentKind::Link,
+            Self::Code => kind == ContentKind::Code,
+            Self::File => kind == ContentKind::File,
+            Self::Image => kind == ContentKind::Image,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryQuery {
+    pub search: String,
+    pub filter: HistoryFilter,
+    pub pinned_only: bool,
+    pub newest_first: bool,
+    pub page: usize,
+}
+
+impl Default for HistoryQuery {
+    fn default() -> Self {
+        Self {
+            search: String::new(),
+            filter: HistoryFilter::All,
+            pinned_only: false,
+            newest_first: true,
+            page: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CardView {
     pub sequence: u32,
@@ -40,7 +86,6 @@ pub struct CardView {
     pub source_app: String,
     pub source_confidence: SourceConfidence,
     pub source_window: String,
-    pub first_ms: i64,
     pub time_full: String,
     pub relative_time: String,
     pub time_range: String,
@@ -99,7 +144,13 @@ impl Retention {
 
 #[derive(Debug, Clone, Default)]
 pub struct UiState {
+    /// Advances only when the worker publishes a changed snapshot.
+    pub revision: u64,
     pub cards: Vec<CardView>,
+    pub history_query: HistoryQuery,
+    pub history_active: bool,
+    pub history_has_next: bool,
+    pub modal_image: Option<(u32, iced::widget::image::Handle)>,
     pub selected: Option<u32>,
     pub record_count: usize,
     pub retention: Retention,
@@ -116,37 +167,11 @@ pub struct UiState {
 
 pub type SharedUi = Arc<Mutex<UiState>>;
 
-pub fn snapshot_from_flow(
-    flow: &FlowEngine,
-    retention: Retention,
-    tracking: bool,
-    excluded_apps: Vec<String>,
-    expanded_raw: bool,
-    status_note: String,
-) -> UiState {
-    let now = format::now_ms();
-    let cards: Vec<CardView> = flow
-        .history_cards()
-        .into_iter()
-        .map(|c| card_view(&c, now))
-        .collect();
-    UiState {
-        cards,
-        selected: None,
-        record_count: flow.len(),
-        retention,
-        tracking,
-        tracking_ack: 0,
-        excluded_apps,
-        expanded_raw,
-        status_note,
-        hotkey_selected: Hotkey::default(),
-        hotkey_active: Hotkey::Disabled,
-        hotkey_error: None,
-    }
-}
-
-pub fn card_view(c: &HistoryCard<'_>, now_ms: i64) -> CardView {
+pub fn card_view_with_cached_image(
+    c: &HistoryCard<'_>,
+    now_ms: i64,
+    cached_image: Option<&iced::widget::image::Handle>,
+) -> CardView {
     let used_in: Vec<UsedInView> = c
         .used_in
         .iter()
@@ -168,7 +193,9 @@ pub fn card_view(c: &HistoryCard<'_>, now_ms: i64) -> CardView {
         ClipboardPayload::Text(_) => CardPayloadView::Text,
         ClipboardPayload::Files(paths) => CardPayloadView::Files(paths.clone()),
         ClipboardPayload::Image { png, width, height } => CardPayloadView::Image {
-            handle: iced::widget::image::Handle::from_bytes(png.clone()),
+            handle: cached_image
+                .cloned()
+                .unwrap_or_else(|| image_thumbnail_handle(png)),
             width: *width,
             height: *height,
             encoded_bytes: png.len(),
@@ -186,7 +213,6 @@ pub fn card_view(c: &HistoryCard<'_>, now_ms: i64) -> CardView {
         source_app: c.source_app.to_string(),
         source_confidence: c.source_confidence,
         source_window: c.source_window.to_string(),
-        first_ms: c.first_created_at_ms,
         time_full: crate::format::full_time_label(c.first_created_at_ms),
         relative_time: crate::format::relative_time(c.first_created_at_ms, now_ms),
         time_range: crate::format::time_range_label(c.first_created_at_ms, c.last_created_at_ms),
@@ -194,5 +220,47 @@ pub fn card_view(c: &HistoryCard<'_>, now_ms: i64) -> CardView {
         used_in_apps,
         has_paste_activity: c.has_paste_activity,
         paste_detail: PasteConfidence::HotkeyObserved.detail_copy(),
+    }
+}
+
+fn image_thumbnail_handle(png: &[u8]) -> iced::widget::image::Handle {
+    const THUMBNAIL_SIDE: u32 = 128;
+    match image::load_from_memory_with_format(png, ImageFormat::Png) {
+        Ok(decoded) => {
+            let thumbnail = decoded
+                .thumbnail(THUMBNAIL_SIDE, THUMBNAIL_SIDE)
+                .into_rgba8();
+            iced::widget::image::Handle::from_rgba(
+                thumbnail.width(),
+                thumbnail.height(),
+                thumbnail.into_raw(),
+            )
+        }
+        Err(_) => iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_image_handle_is_bounded_by_thumbnail_size() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            400,
+            200,
+            image::Rgba([20, 40, 60, 255]),
+        ));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+
+        match image_thumbnail_handle(&png) {
+            iced::widget::image::Handle::Rgba { width, height, .. } => {
+                assert_eq!((width, height), (128, 64));
+            }
+            _ => panic!("history image should use decoded thumbnail pixels"),
+        }
     }
 }

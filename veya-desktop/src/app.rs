@@ -11,8 +11,11 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
-use crate::capture::{CardPayloadView, CardView, Retention, SharedUi, UiState};
+use crate::capture::{
+    CardPayloadView, CardView, HistoryFilter, HistoryQuery, Retention, SharedUi, UiState,
+};
 use crate::format::{self, ContentKind};
 use crate::icons::{self, Icon};
 use crate::theme::{self, body, meta, pad, section_label};
@@ -181,15 +184,17 @@ impl Filter {
             Filter::Image => Icon::Image,
         }
     }
+}
 
-    fn matches(self, kind: ContentKind) -> bool {
-        match self {
-            Filter::All => true,
-            Filter::Text => kind == ContentKind::Text,
-            Filter::Link => kind == ContentKind::Link,
-            Filter::Code => kind == ContentKind::Code,
-            Filter::File => kind == ContentKind::File,
-            Filter::Image => kind == ContentKind::Image,
+impl From<Filter> for HistoryFilter {
+    fn from(filter: Filter) -> Self {
+        match filter {
+            Filter::All => Self::All,
+            Filter::Text => Self::Text,
+            Filter::Link => Self::Link,
+            Filter::Code => Self::Code,
+            Filter::File => Self::File,
+            Filter::Image => Self::Image,
         }
     }
 }
@@ -239,6 +244,8 @@ pub struct App {
     filter: Filter,
     pinned_only: bool,
     sort_order: SortOrder,
+    history_page: usize,
+    history_active: bool,
     list_density: ListDensity,
     exclude_input: String,
     detail_menu_open: bool,
@@ -289,6 +296,8 @@ pub enum Message {
     SetFilter(Filter),
     TogglePinnedOnly,
     SetSortOrder(SortOrder),
+    PreviousHistoryPage,
+    NextHistoryPage,
     ToggleListDensity,
     WindowDrag,
     WindowReady(iced::window::Id),
@@ -343,6 +352,8 @@ impl App {
                 filter: Filter::All,
                 pinned_only: false,
                 sort_order: SortOrder::default(),
+                history_page: 0,
+                history_active: false,
                 list_density: ListDensity::default(),
                 exclude_input: String::new(),
                 detail_menu_open: false,
@@ -366,8 +377,69 @@ impl App {
         Theme::Dark
     }
 
+    fn history_query(&self) -> HistoryQuery {
+        HistoryQuery {
+            search: self.search.clone(),
+            filter: self.filter.into(),
+            pinned_only: self.pinned_only,
+            newest_first: self.sort_order == SortOrder::Newest,
+            page: self.history_page,
+        }
+    }
+
+    pub(super) fn history_query_pending(&self) -> bool {
+        self.state.history_query != self.history_query()
+            || (self.history_active && !self.state.history_active)
+    }
+
+    fn set_history_active(&mut self, active: bool) {
+        if self.history_active == active {
+            return;
+        }
+        self.history_active = active;
+        if !active {
+            self.unload_full_image();
+            self.state.cards.clear();
+            self.state.selected = None;
+            self.state.history_active = false;
+            self.state.history_has_next = false;
+        }
+        let _ = self.worker.cmd_tx.send(WorkerCmd::SetHistoryActive(active));
+    }
+
+    fn request_history_query(&mut self, reset_page: bool) -> Task<Message> {
+        if reset_page {
+            self.history_page = 0;
+        }
+        let query = self.history_query();
+        let _ = self.worker.cmd_tx.send(WorkerCmd::QueryHistory(query));
+        self.ensure_visible_selection();
+        scrollable::snap_to(history_scroll_id(), scrollable::RelativeOffset::START)
+    }
+
+    fn unload_full_image(&mut self) {
+        if self.content_modal_for.take().is_some() || self.state.modal_image.is_some() {
+            self.state.modal_image = None;
+            let _ = self.worker.cmd_tx.send(WorkerCmd::UnloadFullImage);
+        }
+    }
+
+    fn sync_chrome_now(&mut self) {
+        #[cfg(windows)]
+        {
+            self.chrome_sync_pending =
+                !veya_windows::platform::chrome::apply_rounded_corners("Veya");
+        }
+        #[cfg(not(windows))]
+        {
+            self.chrome_sync_pending = false;
+        }
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
-        let ticks = iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::Tick);
+        let tick_interval = if self.window_hidden { 50 } else { 100 };
+        let ticks = iced::time::every(std::time::Duration::from_millis(tick_interval))
+            .map(|_| Message::Tick);
         let keys = if self.hotkey_recording {
             iced::event::listen_with(record_hotkey_event)
         } else {
@@ -396,16 +468,7 @@ impl App {
                 self.updates.poll();
                 let mut tasks = Vec::new();
                 if self.chrome_sync_pending {
-                    #[cfg(windows)]
-                    {
-                        if veya_windows::platform::chrome::apply_rounded_corners("Veya") {
-                            self.chrome_sync_pending = false;
-                        }
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        self.chrome_sync_pending = false;
-                    }
+                    self.sync_chrome_now();
                     self.chrome_sync_attempts = self.chrome_sync_attempts.saturating_add(1);
                     if self.chrome_sync_attempts >= 4 {
                         self.chrome_sync_pending = false;
@@ -433,6 +496,7 @@ impl App {
                         TrayCmd::OpenWindow => window_signals.push(WindowSignal::Activate),
                         TrayCmd::OpenSettings => {
                             self.page = Page::Settings;
+                            self.set_history_active(false);
                             window_signals.push(WindowSignal::Activate);
                         }
                         other => {
@@ -456,9 +520,16 @@ impl App {
                 ) {
                     tasks.push(self.apply_window_action(action));
                 }
-                if let Ok(guard) = self.shared.lock() {
-                    let mut next = guard.clone();
-                    self.tracking_control.reconcile(&mut next);
+                let snapshot = self.shared.lock().ok().and_then(|guard| {
+                    (guard.revision != self.state.revision).then(|| guard.clone())
+                });
+                if let Some(mut next) = snapshot {
+                    if !self.history_active {
+                        next.cards.clear();
+                        next.modal_image = None;
+                        next.history_active = false;
+                        next.history_has_next = false;
+                    }
                     next.selected = self
                         .state
                         .selected
@@ -467,13 +538,14 @@ impl App {
                     next.expanded_raw = self.state.expanded_raw;
                     self.state = next;
                 }
+                self.tracking_control.reconcile(&mut self.state);
                 self.ensure_visible_selection();
                 self.cache_selected_source_path();
                 if self
                     .content_modal_for
                     .is_some_and(|seq| !self.state.cards.iter().any(|card| card.sequence == seq))
                 {
-                    self.content_modal_for = None;
+                    self.unload_full_image();
                 }
                 if self.card_menu.is_some_and(|menu| {
                     !self
@@ -487,8 +559,8 @@ impl App {
             }
             Message::SearchChanged(q) => {
                 self.search = q;
-                self.ensure_visible_selection();
-                Task::none()
+                self.unload_full_image();
+                self.request_history_query(true)
             }
             Message::Select(seq) => {
                 self.select_history_card(seq);
@@ -579,7 +651,8 @@ impl App {
             Message::GoPage(p) => {
                 self.cancel_hotkey_recording();
                 self.page = p;
-                self.content_modal_for = None;
+                self.unload_full_image();
+                self.set_history_active(p == Page::History && !self.window_hidden);
                 Task::none()
             }
             Message::ToggleRaw => {
@@ -601,13 +674,17 @@ impl App {
                 Task::none()
             }
             Message::OpenContentModal(seq) => {
-                if self.state.cards.iter().any(|card| card.sequence == seq) {
+                self.unload_full_image();
+                if let Some(card) = self.state.cards.iter().find(|card| card.sequence == seq) {
                     self.content_modal_for = Some(seq);
+                    if matches!(&card.payload, CardPayloadView::Image { .. }) {
+                        let _ = self.worker.cmd_tx.send(WorkerCmd::LoadFullImage(seq));
+                    }
                 }
                 Task::none()
             }
             Message::CloseContentModal => {
-                self.content_modal_for = None;
+                self.unload_full_image();
                 Task::none()
             }
             Message::OpenSource(app) => {
@@ -648,18 +725,36 @@ impl App {
             }
             Message::SetFilter(f) => {
                 self.filter = f;
-                self.ensure_visible_selection();
-                Task::none()
+                self.unload_full_image();
+                self.request_history_query(true)
             }
             Message::TogglePinnedOnly => {
                 self.pinned_only = !self.pinned_only;
-                self.ensure_visible_selection();
-                Task::none()
+                self.unload_full_image();
+                self.request_history_query(true)
             }
             Message::SetSortOrder(order) => {
                 self.sort_order = order;
-                self.ensure_visible_selection();
-                scrollable::snap_to(history_scroll_id(), scrollable::RelativeOffset::START)
+                self.unload_full_image();
+                self.request_history_query(true)
+            }
+            Message::PreviousHistoryPage => {
+                if !self.history_query_pending() && self.history_page > 0 {
+                    self.history_page -= 1;
+                    self.unload_full_image();
+                    self.request_history_query(false)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::NextHistoryPage => {
+                if !self.history_query_pending() && self.state.history_has_next {
+                    self.history_page = self.history_page.saturating_add(1);
+                    self.unload_full_image();
+                    self.request_history_query(false)
+                } else {
+                    Task::none()
+                }
             }
             Message::ToggleListDensity => {
                 self.list_density = match self.list_density {
@@ -674,11 +769,13 @@ impl App {
                 .unwrap_or_else(Task::none),
             Message::WindowReady(id) => {
                 self.window_id = Some(id);
+                self.set_history_active(self.page == Page::History);
                 Task::none()
             }
             Message::WindowMinimize => {
                 self.cancel_hotkey_recording();
                 self.window_hidden = false;
+                self.set_history_active(false);
                 minimize_window()
             }
             Message::WindowToggleMaximize => iced::window::get_latest().then(|id| {
@@ -693,13 +790,16 @@ impl App {
             }
             Message::WindowRestored(id) => {
                 self.window_id = Some(id);
+                self.set_history_active(self.page == Page::History);
                 #[cfg(windows)]
                 veya_windows::platform::singleton::ensure_main_window_visible();
                 self.chrome_sync_pending = true;
+                self.chrome_sync_attempts = 0;
                 iced::window::gain_focus(id)
             }
             Message::WindowClose => {
                 self.cancel_hotkey_recording();
+                self.set_history_active(false);
                 if self.tray_rx.is_some() {
                     self.window_hidden = true;
                     hide_window()
@@ -787,6 +887,7 @@ impl App {
                     return Task::none();
                 }
                 self.page = Page::History;
+                self.set_history_active(!self.window_hidden);
                 text_input::focus(search_input_id())
             }
             Message::ClearSearch => {
@@ -795,7 +896,7 @@ impl App {
                     return Task::none();
                 }
                 if self.content_modal_for.is_some() {
-                    self.content_modal_for = None;
+                    self.unload_full_image();
                     return Task::none();
                 }
                 if card_menu_was_open {
@@ -803,10 +904,11 @@ impl App {
                 }
                 if !self.search.is_empty() {
                     self.search.clear();
-                    self.ensure_visible_selection();
-                    Task::none()
+                    self.unload_full_image();
+                    self.request_history_query(true)
                 } else {
                     self.page = Page::History;
+                    self.set_history_active(!self.window_hidden);
                     Task::none()
                 }
             }
@@ -816,7 +918,7 @@ impl App {
     fn select_history_card(&mut self, seq: u32) {
         self.state.selected = Some(seq);
         self.detail_menu_open = false;
-        self.content_modal_for = None;
+        self.unload_full_image();
         self.show_qrcode = false;
         if let Ok(mut guard) = self.shared.lock() {
             guard.selected = Some(seq);
@@ -828,16 +930,19 @@ impl App {
         match action {
             WindowAction::Show => {
                 self.window_hidden = false;
+                self.set_history_active(self.page == Page::History);
                 activate_window()
             }
             WindowAction::Hide => {
                 self.cancel_hotkey_recording();
                 self.window_hidden = true;
+                self.set_history_active(false);
                 hide_window()
             }
             WindowAction::Minimize => {
                 self.cancel_hotkey_recording();
                 self.window_hidden = false;
+                self.set_history_active(false);
                 minimize_window()
             }
         }
@@ -942,14 +1047,8 @@ impl App {
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
-        const LOGO: &[u8] = include_bytes!("../../icons/64x64.png");
         let logo = row![
-            container(
-                iced::widget::image(iced::widget::image::Handle::from_bytes(LOGO))
-                    .width(30)
-                    .height(30),
-            )
-            .padding(0),
+            container(iced::widget::image(logo_handle()).width(30).height(30),).padding(0),
             column![
                 text("Veya")
                     .size(19)
@@ -1167,14 +1266,8 @@ impl App {
 
         let bar = row![
             container(left_part).width(Length::FillPortion(7)),
-            mouse_area(
-                container(meta("拖动窗口").size(11).color(theme::FAINT))
-                    .width(Length::Fixed(96.0))
-                    .height(Length::Fixed(42.0))
-                    .center_x(Length::Fixed(96.0))
-                    .center_y(Length::Fixed(42.0)),
-            )
-            .on_press(Message::WindowDrag),
+            mouse_area(Space::new(Length::Fixed(96.0), Length::Fixed(42.0)))
+                .on_press(Message::WindowDrag),
             pause,
             Space::with_width(6.0),
             win,
@@ -1571,40 +1664,17 @@ fn detail_content_preview(content: &str) -> (String, bool) {
     (preview, truncated)
 }
 
-fn visible_cards<'a>(
-    all_cards: &'a [CardView],
-    filter: Filter,
-    pinned_only: bool,
-    order: SortOrder,
-    search: &str,
-) -> Vec<&'a CardView> {
-    let q = search.trim();
-    let mut cards: Vec<_> = all_cards
-        .iter()
-        .filter(|card| {
-            filter.matches(card.kind)
-                && (!pinned_only || card.pinned)
-                && veya_core::match_field(
-                    &card.full_content,
-                    &card.source_app,
-                    card.used_in_apps.iter().map(|s| s.as_str()),
-                    q,
-                )
-                .is_some()
-        })
-        .collect();
-    cards.sort_by(|a, b| {
-        let cmp = (a.first_ms, a.sequence).cmp(&(b.first_ms, b.sequence));
-        match order {
-            SortOrder::Newest => cmp.reverse(),
-            SortOrder::Oldest => cmp,
-        }
-    });
-    cards
-}
-
 fn history_scroll_id() -> scrollable::Id {
     scrollable::Id::new("history-list")
+}
+
+fn logo_handle() -> iced::widget::image::Handle {
+    static LOGO: OnceLock<iced::widget::image::Handle> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        const BYTES: &[u8] = include_bytes!("../../icons/64x64.png");
+        iced::widget::image::Handle::from_bytes(BYTES)
+    })
+    .clone()
 }
 
 fn compact_preview(content: &str, max_cells: usize) -> String {
@@ -1633,100 +1703,6 @@ fn search_input_id() -> text_input::Id {
 #[cfg(test)]
 mod history_controls_tests {
     use super::*;
-
-    fn card(sequence: u32, first_ms: i64, content: &str) -> CardView {
-        CardView {
-            sequence,
-            raw_count: 1,
-            raw_sequences: vec![sequence],
-            content_preview: content.to_string(),
-            full_content: content.to_string(),
-            payload: CardPayloadView::Text,
-            kind: format::content_kind(content),
-            pinned: false,
-            source_app: "test.exe".to_string(),
-            source_confidence: veya_core::SourceConfidence::Exact,
-            source_window: String::new(),
-            first_ms,
-            time_full: String::new(),
-            relative_time: String::new(),
-            time_range: String::new(),
-            used_in: Vec::new(),
-            used_in_apps: Vec::new(),
-            has_paste_activity: false,
-            paste_detail: "",
-        }
-    }
-
-    #[test]
-    fn filtering_search_and_sort_use_actual_content_and_stable_ties() {
-        let mut cards = vec![
-            card(3, 200, "SELECT * FROM users"),
-            card(1, 100, "https://example.com"),
-            card(2, 200, r"C:\Users\admin\report.pdf"),
-            card(4, 200, "ordinary note"),
-        ];
-        cards[0].pinned = true;
-        let sequences = |filter, pinned_only, sort, query| {
-            visible_cards(&cards, filter, pinned_only, sort, query)
-                .iter()
-                .map(|card| card.sequence)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(sequences(Filter::Code, false, SortOrder::Newest, ""), [3]);
-        assert_eq!(
-            format::content_kind("// Rust snippet\nfn process() {}"),
-            ContentKind::Code
-        );
-        assert_eq!(sequences(Filter::Link, false, SortOrder::Newest, ""), [1]);
-        assert_eq!(
-            sequences(Filter::Text, false, SortOrder::Newest, ""),
-            [4, 2]
-        );
-        assert_eq!(
-            sequences(Filter::Text, false, SortOrder::Newest, "report"),
-            [2]
-        );
-        assert_eq!(
-            sequences(Filter::All, false, SortOrder::Oldest, ""),
-            [1, 2, 3, 4]
-        );
-        assert_eq!(
-            sequences(Filter::All, false, SortOrder::Newest, ""),
-            [4, 3, 2, 1]
-        );
-        assert!(sequences(Filter::File, false, SortOrder::Newest, "").is_empty());
-        assert!(sequences(Filter::Image, false, SortOrder::Newest, "").is_empty());
-        assert_eq!(sequences(Filter::All, true, SortOrder::Newest, ""), [3]);
-        assert_eq!(sequences(Filter::Code, true, SortOrder::Newest, ""), [3]);
-    }
-
-    #[test]
-    fn file_and_image_filters_follow_the_captured_payload_kind() {
-        let mut cards = vec![
-            card(1, 100, r"C:\Users\admin\Pictures\photo.png"),
-            card(2, 200, "image 640 × 480"),
-        ];
-        cards[0].payload =
-            CardPayloadView::Files(vec![r"C:\Users\admin\Pictures\photo.png".into()]);
-        cards[0].kind = ContentKind::File;
-        cards[1].payload = CardPayloadView::Image {
-            handle: iced::widget::image::Handle::from_bytes(vec![137, 80, 78, 71]),
-            width: 640,
-            height: 480,
-            encoded_bytes: 4,
-        };
-        cards[1].kind = ContentKind::Image;
-
-        let sequences = |filter| {
-            visible_cards(&cards, filter, false, SortOrder::Newest, "")
-                .iter()
-                .map(|card| card.sequence)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(sequences(Filter::File), [1]);
-        assert_eq!(sequences(Filter::Image), [2]);
-    }
 
     #[test]
     fn compact_preview_keeps_one_bounded_line() {

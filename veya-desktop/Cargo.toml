@@ -15,7 +15,6 @@ veya-windows = { workspace = true }
 veya-storage = { workspace = true }
 iced = { version = "0.13", features = ["tokio", "image", "svg"] }
 iced_graphics = "0.13"
-fontdb = "0.23"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]

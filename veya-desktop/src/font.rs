@@ -1,14 +1,11 @@
-//! 中文字体：只选 CJK 字族，并把字体文件注册进 iced/cosmic-text。
+//! 中文字体：从 iced/cosmic-text 已加载的系统字体中选择 CJK 字族。
 //!
 //! Windows 上 `msyh.ttc` 的族名是 `微软雅黑` / `Microsoft YaHei UI`，
 //! 系统消息字体却常常是 `Segoe UI`（无汉字）。若按「消息字体优先」就会
 //! 整界面豆腐块。这里白名单 CJK 字族，并 `set_sans_serif_family` 兜底。
 
-use std::borrow::Cow;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use fontdb::Database;
 use iced::font::{Family, Font};
 
 struct UiFont {
@@ -33,7 +30,7 @@ const CJK_FAMILIES: &[&str] = &[
     "PingFang SC",
 ];
 
-/// 已知的 Windows 中文 UI 字体文件（fontdb 名匹配失败时仍加载字节）。
+/// 已知的 Windows 中文 UI 字体文件（系统字体扫描失败时作为文件映射加载）。
 const CJK_FILES: &[&str] = &[
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\msyhbd.ttc",
@@ -41,7 +38,7 @@ const CJK_FILES: &[&str] = &[
     r"C:\Windows\Fonts\simhei.ttf",
 ];
 
-/// 应用默认 UI 字体（含中文）。首次调用完成选择并注册字形。
+/// 应用默认 UI 字体（含中文）。首次调用完成选择。
 pub fn install() -> Font {
     init().font
 }
@@ -69,63 +66,46 @@ pub fn mono_font() -> Font {
 
 fn init() -> &'static UiFont {
     UI.get_or_init(|| {
-        let mut db = Database::new();
-        db.load_system_fonts();
-
-        let mut family: &str = "Microsoft YaHei UI";
-        let mut load_paths: Vec<PathBuf> = Vec::new();
-
-        for name in CJK_FAMILIES {
-            let mut matched = false;
-            for f in db.faces() {
-                if f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                    matched = true;
-                    if let fontdb::Source::File(p) = &f.source {
-                        if !load_paths.contains(p) {
-                            load_paths.push(p.clone());
-                        }
+        use iced_graphics::text::font_system;
+        let mut fs = font_system().write().expect("iced font system");
+        let db = fs.raw().db_mut();
+        let mut family = CJK_FAMILIES.iter().copied().find(|name| {
+            db.faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(name))
+            })
+        });
+        let mut fallback_files = 0;
+        if family.is_none() {
+            for path in CJK_FILES {
+                if db.load_font_file(path).is_ok() {
+                    fallback_files += 1;
+                    family = CJK_FAMILIES.iter().copied().find(|name| {
+                        db.faces().any(|face| {
+                            face.families
+                                .iter()
+                                .any(|(n, _)| n.eq_ignore_ascii_case(name))
+                        })
+                    });
+                    if family.is_some() {
+                        break;
                     }
                 }
             }
-            if matched {
-                family = name;
-                break;
-            }
         }
+        let family = family.unwrap_or("Microsoft YaHei UI");
 
-        for p in CJK_FILES {
-            let path = PathBuf::from(p);
-            if path.exists() && !load_paths.contains(&path) {
-                load_paths.push(path);
-            }
-        }
+        // Family::Name and the generic families must resolve to CJK glyphs.
+        db.set_sans_serif_family(family);
+        db.set_serif_family(family);
+        db.set_monospace_family("Consolas");
 
-        // 注册进 iced 的 cosmic-text FontSystem：Family::Name 才能命中，
-        // 且把 SansSerif 默认族改成中文，避免 Font::DEFAULT 再落到 Fira Sans。
-        {
-            use iced_graphics::text::font_system;
-            let mut fs = font_system().write().expect("iced font system");
-            for path in &load_paths {
-                if let Ok(bytes) = std::fs::read(path) {
-                    fs.load_font(Cow::Owned(bytes));
-                }
-            }
-            let db = fs.raw().db_mut();
-            db.set_sans_serif_family(family);
-            db.set_serif_family(family);
-            // 代码用 Consolas；缺字时 cosmic-text 仍会按脚本回退到 CJK。
-            db.set_monospace_family("Consolas");
-        }
-
-        let family_static: &'static str = Box::leak(family.to_owned().into_boxed_str());
         let font = Font {
-            family: Family::Name(family_static),
+            family: Family::Name(family),
             ..Font::DEFAULT
         };
-        eprintln!(
-            "[veya-font] family={family_static} loaded_files={}",
-            load_paths.len()
-        );
+        eprintln!("[veya-font] family={family} fallback_files={fallback_files}");
         UiFont { font }
     })
 }

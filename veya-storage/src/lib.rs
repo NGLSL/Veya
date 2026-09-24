@@ -2,7 +2,7 @@
 //!
 //! Raw events are never merged. Aggregation is a read-model concern (veya-core).
 
-use std::path::Path;
+use std::{collections::HashMap, fmt::Write as _, path::Path};
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use veya_core::{
@@ -186,6 +186,93 @@ impl Store {
         tx.commit()
     }
 
+    /// Return the number of raw clipboard records without loading their payloads.
+    pub fn count_records(&self) -> rusqlite::Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM clipboard_record", [], |row| {
+                    row.get(0)
+                })?;
+        usize::try_from(count).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(error))
+        })
+    }
+
+    /// Load one keyset page of raw records.
+    ///
+    /// `cursor` is the `(created_at_ms, sequence)` key of the last record from
+    /// the preceding page. The next page advances in the direction selected by
+    /// `newest_first`, so equal timestamps remain deterministic by sequence.
+    /// Only paste associations belonging to records in this page are loaded.
+    pub fn load_records_page(
+        &self,
+        cursor: Option<(i64, u32)>,
+        limit: usize,
+        newest_first: bool,
+    ) -> rusqlite::Result<Vec<ClipboardRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let direction = if newest_first { "DESC" } else { "ASC" };
+        let comparison = if newest_first { "<" } else { ">" };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            r#"
+            SELECT sequence, content_type, content, content_hash,
+                   source_app, source_pid, source_window, source_confidence, created_at_ms, pinned,
+                   payload, image_width, image_height
+            FROM clipboard_record
+            WHERE (?1 IS NULL
+                   OR created_at_ms {comparison} ?1
+                   OR (created_at_ms = ?1 AND sequence {comparison} ?2))
+            ORDER BY created_at_ms {direction}, sequence {direction}
+            LIMIT ?3
+            "#,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut records = match cursor {
+            Some((created_at_ms, sequence)) => stmt
+                .query_map(
+                    params![created_at_ms, i64::from(sequence), limit],
+                    decode_record,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map(
+                    params![Option::<i64>::None, Option::<i64>::None, limit],
+                    decode_record,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        drop(stmt);
+
+        self.load_pastes_for_records(&mut records)?;
+        Ok(records)
+    }
+
+    /// Load one raw clipboard record and its paste associations by sequence.
+    pub fn load_record(&self, sequence: u32) -> rusqlite::Result<Option<ClipboardRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT sequence, content_type, content, content_hash,
+                   source_app, source_pid, source_window, source_confidence, created_at_ms, pinned,
+                   payload, image_width, image_height
+            FROM clipboard_record
+            WHERE sequence = ?1
+            "#,
+        )?;
+        let mut record = stmt
+            .query_row(params![i64::from(sequence)], decode_record)
+            .optional()?;
+        drop(stmt);
+
+        if let Some(record) = record.as_mut() {
+            self.load_pastes_for_records(std::slice::from_mut(record))?;
+        }
+        Ok(record)
+    }
+
     pub fn load_all(&self) -> rusqlite::Result<Vec<ClipboardRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -249,6 +336,64 @@ impl Store {
             }
         }
         Ok(records)
+    }
+
+    fn load_pastes_for_records(&self, records: &mut [ClipboardRecord]) -> rusqlite::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let positions: HashMap<u32, usize> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.sequence, index))
+            .collect();
+        let sequences: Vec<i64> = records
+            .iter()
+            .map(|record| i64::from(record.sequence))
+            .collect();
+
+        // Keep the association query below SQLite's variable limit even if a
+        // caller requests an unusually large page.
+        for chunk in sequences.chunks(900) {
+            let mut placeholders = String::new();
+            for index in 0..chunk.len() {
+                if index > 0 {
+                    placeholders.push_str(", ");
+                }
+                write!(&mut placeholders, "?{}", index + 1).expect("writing SQL placeholder");
+            }
+            let sql = format!(
+                r#"
+                SELECT clipboard_record_id, target_app, target_pid, target_window,
+                       method, confidence, triggered_at_ms
+                FROM paste_trigger
+                WHERE clipboard_record_id IN ({placeholders})
+                ORDER BY clipboard_record_id ASC, triggered_at_ms ASC, id ASC
+                "#,
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let pastes = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    PasteTriggerRecord {
+                        target_app: row.get(1)?,
+                        target_pid: row.get::<_, i64>(2)? as u32,
+                        target_window: row.get(3)?,
+                        method: parse_method(&row.get::<_, String>(4)?),
+                        confidence: parse_paste_confidence(&row.get::<_, String>(5)?),
+                        triggered_at_ms: row.get(6)?,
+                    },
+                ))
+            })?;
+            for item in pastes {
+                let (sequence, paste) = item?;
+                if let Some(&index) = positions.get(&sequence) {
+                    records[index].pastes.push(paste);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn delete_record(&mut self, sequence: u32) -> rusqlite::Result<usize> {
@@ -338,6 +483,30 @@ impl Store {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect()
     }
+}
+
+fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardRecord> {
+    let content_type: String = row.get(1)?;
+    let content: String = row.get(2)?;
+    let blob: Option<Vec<u8>> = row.get(10)?;
+    let width: Option<i64> = row.get(11)?;
+    let height: Option<i64> = row.get(12)?;
+    let payload = decode_payload(&content_type, &content, blob, width, height)?;
+    let content = payload.display_text();
+    Ok(ClipboardRecord {
+        sequence: row.get::<_, i64>(0)? as u32,
+        content_type,
+        content,
+        payload,
+        content_hash: row.get(3)?,
+        source_app: row.get(4)?,
+        source_pid: row.get::<_, i64>(5)? as u32,
+        source_window: row.get(6)?,
+        source_confidence: parse_confidence(&row.get::<_, String>(7)?),
+        created_at_ms: row.get(8)?,
+        pinned: row.get::<_, i64>(9)? != 0,
+        pastes: Vec::new(),
+    })
 }
 
 fn has_column(conn: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
@@ -530,6 +699,145 @@ mod tests {
         store.set_pinned(&[1], true).unwrap();
         store.clear().unwrap();
         assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn paged_history_uses_stable_keyset_cursor_in_both_directions() {
+        let mut store = Store::open_in_memory().unwrap();
+        for (sequence, created_at_ms) in [(1, 100), (2, 100), (3, 100), (4, 200), (5, 300)] {
+            let mut record = rec(sequence);
+            record.created_at_ms = created_at_ms;
+            store.insert_record(&record).unwrap();
+        }
+
+        assert_eq!(store.count_records().unwrap(), 5);
+
+        let oldest_first = store.load_records_page(None, 2, false).unwrap();
+        assert_eq!(
+            oldest_first
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let oldest_second = store
+            .load_records_page(
+                Some((oldest_first[1].created_at_ms, oldest_first[1].sequence)),
+                2,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            oldest_second
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        let oldest_last = store
+            .load_records_page(
+                Some((oldest_second[1].created_at_ms, oldest_second[1].sequence)),
+                2,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            oldest_last
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert!(store
+            .load_records_page(
+                Some((oldest_last[0].created_at_ms, oldest_last[0].sequence)),
+                2,
+                false,
+            )
+            .unwrap()
+            .is_empty());
+
+        let newest_first = store.load_records_page(None, 2, true).unwrap();
+        assert_eq!(
+            newest_first
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        let newest_second = store
+            .load_records_page(
+                Some((newest_first[1].created_at_ms, newest_first[1].sequence)),
+                2,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            newest_second
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        let newest_last = store
+            .load_records_page(
+                Some((newest_second[1].created_at_ms, newest_second[1].sequence)),
+                2,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            newest_last
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(store
+            .load_records_page(
+                Some((newest_last[0].created_at_ms, newest_last[0].sequence)),
+                2,
+                true,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn paged_and_single_record_reads_preserve_images_and_page_pastes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut image = rec(1);
+        image.created_at_ms = 100;
+        image.payload = ClipboardPayload::Image {
+            png: vec![137, 80, 78, 71, 1, 2, 3],
+            width: 320,
+            height: 240,
+        };
+        image.pastes[0].target_app = "image-target.exe".into();
+
+        let mut later = rec(2);
+        later.created_at_ms = 200;
+        later.pastes[0].target_app = "later-target.exe".into();
+        store.insert_record(&image).unwrap();
+        store.insert_record(&later).unwrap();
+
+        let page = store.load_records_page(None, 1, false).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].sequence, 1);
+        assert_eq!(
+            page[0].payload,
+            ClipboardPayload::Image {
+                png: vec![137, 80, 78, 71, 1, 2, 3],
+                width: 320,
+                height: 240,
+            }
+        );
+        assert_eq!(page[0].pastes.len(), 1);
+        assert_eq!(page[0].pastes[0].target_app, "image-target.exe");
+
+        let loaded = store.load_record(1).unwrap().unwrap();
+        assert_eq!(loaded, page[0]);
+        assert!(store.load_record(999).unwrap().is_none());
     }
 
     #[test]

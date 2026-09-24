@@ -638,17 +638,39 @@ impl App {
         .style(theme::scroll_style)
         .height(Length::Fill);
         let content: Element<'_, Message> =
-            if let CardPayloadView::Image { handle, .. } = &card.payload {
-                container(
-                    iced::widget::image::viewer(handle.clone())
+            if matches!(&card.payload, CardPayloadView::Image { .. }) {
+                let full_image = self
+                    .state
+                    .modal_image
+                    .as_ref()
+                    .filter(|(sequence, _)| *sequence == card.sequence)
+                    .map(|(_, handle)| handle.clone());
+                let image_content: Element<'_, Message> = if let Some(handle) = full_image {
+                    iced::widget::image::viewer(handle)
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain),
-                )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(theme::modal_content_style)
-                .into()
+                        .content_fit(iced::ContentFit::Contain)
+                        .into()
+                } else {
+                    container(
+                        column![
+                            icons::icon(Icon::Image, theme::FAINT, 28.0),
+                            meta("正在加载完整图片…").size(12).color(theme::MUTED),
+                        ]
+                        .spacing(9)
+                        .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+                };
+                container(image_content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(theme::modal_content_style)
+                    .into()
             } else {
                 container(content_scroll)
                     .width(Length::Fill)
