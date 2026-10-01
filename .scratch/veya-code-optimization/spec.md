@@ -22,6 +22,7 @@
 | [04](issues/04-platform-lifecycle.md) | P1 | Win32 注册中途失败跳过清理；私有 RAII 与可见错误 | 无 | 规划，未实施 |
 | [05](issues/05-streaming-aggregation.md) | P2 | desktop 重复 core 分组规则，长组保留全部载荷；core 有序聚合 | 02 | 已实现，等价／跨批次测试通过 |
 | [06](issues/06-snapshot-sharing.md) | P2 | UI 快照全量复制卡片；共享 immutable 当前页 | 01 | 已实现，与 01 一同验证 |
+| [07](issues/07-hidden-cpu.md) | P1 | 隐藏窗口仍消费过期重绘 deadline；Windows runtime 清退到期等待 | 无 | 已修补，开发／release 隐藏 CPU 对照通过 |
 
 02 的窄 metadata 数据契约先确定，再实施 05，避免跨 crate 接口反复变化。03、04 可独立推进。06 不另建缓存框架，直接验证当前 Arc 共享与释放行为。
 

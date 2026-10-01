@@ -32,3 +32,6 @@ windows = { version = "0.61", features = [
 
 [profile.dev]
 opt-level = 1
+
+[patch.crates-io]
+iced_winit = { path = "vendor/iced_winit" }
