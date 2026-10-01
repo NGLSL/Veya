@@ -27,9 +27,13 @@ jobs:
           cargo test --locked --workspace
       - name: Check workspace
         run: cargo check --locked --workspace
-      - name: Build release binary
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+      - name: Build release installer
         shell: pwsh
         run: |
-          cargo build --locked --release -p veya-desktop
-          if ($LASTEXITCODE -ne 0) { throw 'cargo release build failed' }
-          ./scripts/assert-gui-binary.ps1 -Binary target/release/veya.exe
+          ./scripts/build-installer.ps1 -Nsis 'C:\Program Files (x86)\NSIS\makensis.exe'
+      - name: Verify installation, upgrade and uninstall
+        shell: pwsh
+        run: ./scripts/test-installer.ps1 -Installer artifacts/veya-setup.exe -Binary target/release-package/release/veya.exe

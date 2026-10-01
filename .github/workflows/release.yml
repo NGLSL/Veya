@@ -57,6 +57,9 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: ./scripts/build-installer.ps1 -Nsis 'C:\Program Files (x86)\NSIS\makensis.exe'
+      - name: Verify installation, upgrade and uninstall
+        shell: pwsh
+        run: ./scripts/test-installer.ps1 -Installer artifacts/veya-setup.exe -Binary target/release-package/release/veya.exe
       - name: Assemble release notes and checksum
         shell: pwsh
         run: ./scripts/generate-release-report.ps1 -Tag $env:RELEASE_TAG
