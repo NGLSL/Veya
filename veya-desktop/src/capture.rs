@@ -2,8 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use image::ImageFormat;
-use veya_core::{ClipboardPayload, HistoryCard, PasteConfidence, SourceConfidence};
+use veya_core::{
+    ClipboardPayload, HistoryPayload, HistorySummary, PasteConfidence, SourceConfidence,
+};
 use veya_windows::hotkey::Hotkey;
 
 use crate::format::{self, ContentKind};
@@ -21,7 +22,8 @@ pub enum CardPayloadView {
     Text,
     Files(Vec<String>),
     Image {
-        handle: iced::widget::image::Handle,
+        handle: Option<iced::widget::image::Handle>,
+        thumbnail_failed: bool,
         width: u32,
         height: u32,
         encoded_bytes: usize,
@@ -79,7 +81,9 @@ pub struct CardView {
     pub raw_count: usize,
     pub raw_sequences: Vec<u32>,
     pub content_preview: String,
-    pub full_content: String,
+    pub content_excerpt: String,
+    pub content_chars: usize,
+    pub content_hash: String,
     pub payload: CardPayloadView,
     pub kind: ContentKind,
     pub pinned: bool,
@@ -156,6 +160,9 @@ pub struct UiState {
     pub history_query: HistoryQuery,
     pub history_active: bool,
     pub history_has_next: bool,
+    pub history_loading: bool,
+    pub detail_content: Option<(u32, Arc<str>)>,
+    pub detail_error: Option<(u32, String)>,
     pub modal_image: Option<(u32, iced::widget::image::Handle)>,
     pub selected: Option<u32>,
     pub record_count: usize,
@@ -173,18 +180,46 @@ pub struct UiState {
 
 pub type SharedUi = Arc<Mutex<UiState>>;
 
-pub fn card_view_with_cached_image(
-    c: &HistoryCard<'_>,
+pub fn card_view_from_summary(
+    summary: &HistorySummary,
     cached_image: Option<&iced::widget::image::Handle>,
 ) -> CardView {
-    let used_in: Vec<UsedInView> = c
+    let c = &summary.representative;
+    let (kind, payload, content_preview) = match &c.payload {
+        HistoryPayload::Text => (
+            format::history_kind(&c.payload, &c.content),
+            CardPayloadView::Text,
+            format::preview_line(&c.content),
+        ),
+        HistoryPayload::Files(paths) => (
+            ContentKind::File,
+            CardPayloadView::Files(paths.clone()),
+            format::payload_preview(&ClipboardPayload::Files(paths.clone()), ""),
+        ),
+        HistoryPayload::Image {
+            width,
+            height,
+            encoded_bytes,
+        } => (
+            ContentKind::Image,
+            CardPayloadView::Image {
+                handle: cached_image.cloned(),
+                thumbnail_failed: false,
+                width: *width,
+                height: *height,
+                encoded_bytes: *encoded_bytes,
+            },
+            format!("图片 · {width} × {height}"),
+        ),
+    };
+    let used_in: Vec<_> = summary
         .used_in
         .iter()
         .map(|u| UsedInView {
             target_app: u.target_app.clone(),
             target_window: u.target_window.clone(),
             method_label: u.method_label.clone(),
-            time_label: crate::format::time_label(u.triggered_at_ms),
+            time_label: format::time_label(u.triggered_at_ms),
         })
         .collect();
     let mut used_in_apps = Vec::new();
@@ -193,55 +228,27 @@ pub fn card_view_with_cached_image(
             used_in_apps.push(u.target_app.clone());
         }
     }
-    let kind = format::payload_kind(c.payload);
-    let payload = match c.payload {
-        ClipboardPayload::Text(_) => CardPayloadView::Text,
-        ClipboardPayload::Files(paths) => CardPayloadView::Files(paths.clone()),
-        ClipboardPayload::Image { png, width, height } => CardPayloadView::Image {
-            handle: cached_image
-                .cloned()
-                .unwrap_or_else(|| image_thumbnail_handle(png)),
-            width: *width,
-            height: *height,
-            encoded_bytes: png.len(),
-        },
-    };
     CardView {
-        sequence: c.representative_sequence,
-        raw_count: c.copy_count,
-        raw_sequences: c.raw_sequences.clone(),
-        content_preview: format::payload_preview(c.payload, c.content_preview),
-        full_content: c.content.to_string(),
+        sequence: c.sequence,
+        raw_count: summary.copy_count(),
+        raw_sequences: summary.raw_sequences.clone(),
+        content_preview,
+        content_excerpt: c.content.chars().take(512).collect(),
+        content_chars: c.content.chars().count(),
+        content_hash: c.content_hash.clone(),
         payload,
         kind,
         pinned: c.pinned,
-        source_app: c.source_app.to_string(),
+        source_app: c.source_app.clone(),
         source_confidence: c.source_confidence,
-        source_window: c.source_window.to_string(),
-        time_full: crate::format::full_time_label(c.first_created_at_ms),
-        created_at_ms: c.first_created_at_ms,
-        time_range: crate::format::time_range_label(c.first_created_at_ms, c.last_created_at_ms),
+        source_window: c.source_window.clone(),
+        time_full: format::full_time_label(c.created_at_ms),
+        created_at_ms: c.created_at_ms,
+        time_range: format::time_range_label(c.created_at_ms, summary.last_created_at_ms),
+        has_paste_activity: !used_in.is_empty(),
         used_in,
         used_in_apps,
-        has_paste_activity: c.has_paste_activity,
         paste_detail: PasteConfidence::HotkeyObserved.detail_copy(),
-    }
-}
-
-fn image_thumbnail_handle(png: &[u8]) -> iced::widget::image::Handle {
-    const THUMBNAIL_SIDE: u32 = 128;
-    match image::load_from_memory_with_format(png, ImageFormat::Png) {
-        Ok(decoded) => {
-            let thumbnail = decoded
-                .thumbnail(THUMBNAIL_SIDE, THUMBNAIL_SIDE)
-                .into_rgba8();
-            iced::widget::image::Handle::from_rgba(
-                thumbnail.width(),
-                thumbnail.height(),
-                thumbnail.into_raw(),
-            )
-        }
-        Err(_) => iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]),
     }
 }
 
@@ -249,23 +256,55 @@ fn image_thumbnail_handle(png: &[u8]) -> iced::widget::image::Handle {
 mod tests {
     use super::*;
 
-    #[test]
-    fn history_image_handle_is_bounded_by_thumbnail_size() {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            400,
-            200,
-            image::Rgba([20, 40, 60, 255]),
-        ));
-        let mut png = Vec::new();
-        image
-            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
-            .unwrap();
-
-        match image_thumbnail_handle(&png) {
-            iced::widget::image::Handle::Rgba { width, height, .. } => {
-                assert_eq!((width, height), (128, 64));
-            }
-            _ => panic!("history image should use decoded thumbnail pixels"),
+    pub(super) fn summary(content: String) -> HistorySummary {
+        HistorySummary {
+            representative: veya_core::HistoryRecord {
+                sequence: 1,
+                content,
+                payload: HistoryPayload::Text,
+                content_hash: "text-hash".into(),
+                source_app: "editor.exe".into(),
+                source_window: "source".into(),
+                source_confidence: SourceConfidence::Likely,
+                created_at_ms: 1,
+                pinned: false,
+                pastes: Vec::new(),
+            },
+            raw_sequences: vec![1],
+            used_in: Vec::new(),
+            last_created_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn bounded_excerpt_preserves_full_text_classification_and_unicode() {
+        let full = format!("{} fn tail() {{}}", "中".repeat(1_000));
+        let card = card_view_from_summary(&summary(full.clone()), None);
+        assert_eq!(card.kind, ContentKind::Code);
+        assert_eq!(card.content_excerpt.chars().count(), 512);
+        assert_eq!(card.content_chars, full.chars().count());
+        assert!(!card.content_excerpt.contains("fn tail"));
+        assert_eq!(card.source_confidence, SourceConfidence::Likely);
+    }
+
+    #[test]
+    fn image_projection_is_selectable_without_original_bytes_or_thumbnail() {
+        let mut summary = summary("图片 2048 × 2048".into());
+        summary.representative.payload = HistoryPayload::Image {
+            width: 2048,
+            height: 2048,
+            encoded_bytes: 80_000,
+        };
+        let card = card_view_from_summary(&summary, None);
+        assert_eq!(card.kind, ContentKind::Image);
+        assert_eq!(card.sequence, 1);
+        assert!(matches!(
+            card.payload,
+            CardPayloadView::Image {
+                handle: None,
+                width: 2048,
+                ..
+            }
+        ));
     }
 }

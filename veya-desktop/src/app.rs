@@ -269,6 +269,7 @@ pub struct App {
     cursor_position: iced::Point,
     window_size: iced::Size,
     content_modal_for: Option<u32>,
+    requested_content: Option<u32>,
     clear_history_confirmation_open: bool,
     copied_tick: u32,
     show_qrcode: bool,
@@ -416,6 +417,7 @@ impl App {
                 cursor_position: iced::Point::ORIGIN,
                 window_size,
                 content_modal_for: None,
+                requested_content: None,
                 clear_history_confirmation_open: false,
                 copied_tick: 0,
                 show_qrcode: false,
@@ -445,6 +447,7 @@ impl App {
     pub(super) fn history_query_pending(&self) -> bool {
         self.state.history_query != self.history_query()
             || (self.history_active && !self.state.history_active)
+            || self.state.history_loading
     }
 
     fn set_history_active(&mut self, active: bool) {
@@ -453,6 +456,7 @@ impl App {
         }
         self.history_active = active;
         if !active {
+            self.unload_content();
             self.unload_full_image();
             self.state.cards = Default::default();
             self.state.selected = None;
@@ -467,6 +471,7 @@ impl App {
             self.history_page = 0;
         }
         let query = self.history_query();
+        self.unload_content();
         let _ = self.worker.cmd_tx.send(WorkerCmd::QueryHistory(query));
         if self.quick.is_some() {
             self.state.selected = None;
@@ -480,6 +485,58 @@ impl App {
             self.state.modal_image = None;
             let _ = self.worker.cmd_tx.send(WorkerCmd::UnloadFullImage);
         }
+    }
+
+    fn unload_content(&mut self) {
+        if self.requested_content.take().is_some() || self.state.detail_content.is_some() {
+            let _ = self.worker.cmd_tx.send(WorkerCmd::UnloadContent);
+        }
+        self.state.detail_content = None;
+        self.state.detail_error = None;
+        self.show_qrcode = false;
+    }
+
+    fn sync_detail_content(&mut self) {
+        let wanted = if self.history_active
+            && !self.window_hidden
+            && self.quick.is_none()
+            && !self.history_query_pending()
+        {
+            self.content_modal_for.or(self.state.selected)
+        } else {
+            None
+        };
+        if self.requested_content != wanted {
+            self.unload_content();
+            self.requested_content = wanted;
+            if let Some(seq) = wanted {
+                let _ = self.worker.cmd_tx.send(WorkerCmd::LoadContent(seq));
+            }
+        }
+        if self
+            .state
+            .detail_content
+            .as_ref()
+            .is_some_and(|(seq, _)| Some(*seq) != wanted)
+        {
+            self.state.detail_content = None;
+        }
+        if self
+            .state
+            .detail_error
+            .as_ref()
+            .is_some_and(|(seq, _)| Some(*seq) != wanted)
+        {
+            self.state.detail_error = None;
+        }
+    }
+
+    fn full_content_for(&self, sequence: u32) -> Option<&str> {
+        self.state
+            .detail_content
+            .as_ref()
+            .filter(|(seq, _)| *seq == sequence)
+            .map(|(_, content)| content.as_ref())
     }
 
     fn sync_chrome_now(&mut self) {
@@ -635,6 +692,7 @@ impl App {
                 }
                 self.tracking_control.reconcile(&mut self.state);
                 self.ensure_visible_selection();
+                self.sync_detail_content();
                 self.cache_selected_source_path();
                 if self
                     .content_modal_for
@@ -661,11 +719,22 @@ impl App {
                 self.request_history_query(true)
             }
             Message::Select(seq) => {
-                self.select_history_card(seq);
+                if self
+                    .filtered_cards()
+                    .iter()
+                    .any(|card| card.sequence == seq)
+                {
+                    self.select_history_card(seq);
+                    self.sync_detail_content();
+                }
                 Task::none()
             }
             Message::OpenCardMenu(seq) => {
-                if self.state.cards.iter().any(|card| card.sequence == seq) {
+                if self
+                    .filtered_cards()
+                    .iter()
+                    .any(|card| card.sequence == seq)
+                {
                     self.select_history_card(seq);
                     self.card_menu = Some(CardMenu {
                         sequence: seq,
@@ -688,7 +757,11 @@ impl App {
                     _ => self.state.selected,
                 };
                 if let Some(seq) = seq {
-                    if self.state.cards.iter().any(|card| card.sequence == seq) {
+                    if self
+                        .filtered_cards()
+                        .iter()
+                        .any(|card| card.sequence == seq)
+                    {
                         let _ = self.worker.cmd_tx.send(WorkerCmd::Recopy { sequence: seq });
                         self.copied_tick = 6; // ~1.5s visual feedback
                     }
@@ -696,9 +769,11 @@ impl App {
                 Task::none()
             }
             Message::CopyPlainText(seq) => {
-                if let Some(card) = self.state.cards.iter().find(|c| c.sequence == seq) {
-                    let text = card.full_content.clone();
-                    let _ = self.worker.cmd_tx.send(WorkerCmd::RecopyText { text });
+                if self.filtered_cards().iter().any(|c| c.sequence == seq) {
+                    let _ = self
+                        .worker
+                        .cmd_tx
+                        .send(WorkerCmd::RecopyPlainText { sequence: seq });
                     self.copied_tick = 6;
                 }
                 Task::none()
@@ -780,12 +855,18 @@ impl App {
             }
             Message::OpenContentModal(seq) => {
                 self.unload_full_image();
-                if let Some(card) = self.state.cards.iter().find(|card| card.sequence == seq) {
+                let is_image = self
+                    .filtered_cards()
+                    .into_iter()
+                    .find(|card| card.sequence == seq)
+                    .map(|card| matches!(&card.payload, CardPayloadView::Image { .. }));
+                if let Some(is_image) = is_image {
                     self.content_modal_for = Some(seq);
-                    if matches!(&card.payload, CardPayloadView::Image { .. }) {
+                    if is_image {
                         let _ = self.worker.cmd_tx.send(WorkerCmd::LoadFullImage(seq));
                     }
                 }
+                self.sync_detail_content();
                 Task::none()
             }
             Message::CloseContentModal => {
@@ -825,7 +906,14 @@ impl App {
                 Task::none()
             }
             Message::ToggleQrCode => {
-                self.show_qrcode = !self.show_qrcode;
+                if self
+                    .state
+                    .selected
+                    .and_then(|seq| self.full_content_for(seq))
+                    .is_some()
+                {
+                    self.show_qrcode = !self.show_qrcode;
+                }
                 Task::none()
             }
             Message::SetFilter(f) => {
@@ -1579,7 +1667,7 @@ fn detail_title(card: &CardView) -> String {
         CardPayloadView::Text => {}
     }
 
-    let t = card.full_content.trim();
+    let t = card.content_excerpt.trim();
     if card.kind == ContentKind::Link {
         if let Some(host) = t.split("://").nth(1) {
             let host_clean = host.split('/').next().unwrap_or(host);
@@ -1649,7 +1737,7 @@ fn detail_subtitle(card: &CardView) -> String {
         CardPayloadView::Text => {}
     }
 
-    let t = card.full_content.trim();
+    let t = card.content_excerpt.trim();
     if card.kind == ContentKind::Link {
         if let Some(host) = t.split("://").nth(1) {
             let host_clean = host.split('/').next().unwrap_or(host);

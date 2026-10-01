@@ -1,11 +1,10 @@
 //! Capture worker: platform events → enrich → FlowEngine → SQLite + UI snapshot.
 
-use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 use veya_core::{
-    aggregate, payload_hash, ClipboardPayload, ClipboardRecord, FlowEngine, InternalClipboardWrite,
+    payload_hash, ClipboardPayload, ClipboardRecord, FlowEngine, InternalClipboardWrite,
     PasteConfidence,
 };
 use veya_storage::Store;
@@ -13,11 +12,11 @@ use veya_windows::hotkey::Hotkey;
 use veya_windows::platform::{enrich_clipboard, enrich_paste, PlatformEvent, WindowSignal};
 use veya_windows::{write_payload, ClipboardWriteError};
 
-use crate::capture::{
-    card_view_with_cached_image, CardPayloadView, CardView, HistoryQuery, Retention, SharedUi,
-    UiState,
-};
-use crate::format::{self, now_ms};
+use crate::capture::{CardPayloadView, CardView, HistoryQuery, Retention, SharedUi, UiState};
+use crate::format::now_ms;
+
+#[path = "history_loader.rs"]
+mod history_loader;
 
 const HISTORY_PAGE_SIZE: usize = 25;
 const HISTORY_READ_BATCH: usize = 16;
@@ -25,7 +24,9 @@ const HISTORY_READ_BATCH: usize = 16;
 pub enum WorkerCmd {
     Recopy { sequence: u32 },
     PreparePaste { sequence: u32, request_id: u64 },
-    RecopyText { text: String },
+    RecopyPlainText { sequence: u32 },
+    LoadContent(u32),
+    UnloadContent,
     ClearHistory,
     SetTracking { on: bool, request_id: Option<u64> },
     SetRetention(Retention),
@@ -113,6 +114,19 @@ fn load_replay_record(
         .ok_or_else(|| "记录已不存在".into())
 }
 
+fn recopy_plain_text(
+    flow: &mut FlowEngine,
+    store: &Store,
+    sequence: u32,
+    writer: impl FnOnce(&ClipboardPayload) -> Result<u32, ClipboardWriteError>,
+) -> Result<u32, String> {
+    let text = store
+        .load_content(sequence)
+        .map_err(|error| format!("读取记录失败：{error}"))?
+        .ok_or_else(|| "记录已不存在".to_string())?;
+    write_internal_payload(flow, &ClipboardPayload::Text(text), writer)
+}
+
 fn prepare_record_paste(
     flow: &mut FlowEngine,
     store: &Store,
@@ -126,83 +140,9 @@ fn prepare_record_paste(
     Ok(written_sequence)
 }
 
-fn same_history_group(left: &ClipboardRecord, right: &ClipboardRecord) -> bool {
-    left.content_hash == right.content_hash
-        && left.pinned == right.pinned
-        && left.source_app == right.source_app
-        && left.created_at_ms.abs_diff(right.created_at_ms)
-            <= aggregate::AGGREGATION_WINDOW_MS as u64
-}
-
-fn load_history_page(
-    store: &Store,
-    query: &HistoryQuery,
-    cached_images: &HashMap<u32, iced::widget::image::Handle>,
-) -> Result<(Vec<CardView>, bool), String> {
-    let mut cursor = None;
-    let mut group = Vec::<ClipboardRecord>::new();
-    let mut cards = Vec::with_capacity(HISTORY_PAGE_SIZE);
-    let mut matched = 0usize;
-    let skip = query.page.saturating_mul(HISTORY_PAGE_SIZE);
-
-    let mut finish_group = |group: &mut Vec<ClipboardRecord>| -> bool {
-        if group.is_empty() {
-            return false;
-        }
-        let aggregated = aggregate::history_cards(group.iter());
-        let card = &aggregated[0];
-        let matches = query.filter.matches(format::payload_kind(card.payload))
-            && (!query.pinned_only || card.pinned)
-            && veya_core::match_field(
-                card.content,
-                card.source_app,
-                card.used_in
-                    .iter()
-                    .map(|use_record| use_record.target_app.as_str()),
-                &query.search,
-            )
-            .is_some();
-        if matches {
-            if matched >= skip.saturating_add(HISTORY_PAGE_SIZE) {
-                return true;
-            }
-            if matched >= skip {
-                cards.push(card_view_with_cached_image(
-                    card,
-                    cached_images.get(&card.representative_sequence),
-                ));
-            }
-            matched += 1;
-        }
-        group.clear();
-        false
-    };
-
-    loop {
-        let batch = store
-            .load_records_page(cursor, HISTORY_READ_BATCH, query.newest_first)
-            .map_err(|error| format!("读取历史失败：{error}"))?;
-        if batch.is_empty() {
-            break;
-        }
-        let count = batch.len();
-        for record in batch {
-            cursor = Some((record.created_at_ms, record.sequence));
-            if group
-                .last()
-                .is_some_and(|last| !same_history_group(last, &record))
-                && finish_group(&mut group)
-            {
-                return Ok((cards, true));
-            }
-            group.push(record);
-        }
-        if count < HISTORY_READ_BATCH {
-            break;
-        }
-    }
-    let has_next = finish_group(&mut group);
-    Ok((cards, has_next))
+#[cfg(test)]
+fn load_history_page(store: &Store, query: &HistoryQuery) -> Result<(Vec<CardView>, bool), String> {
+    history_loader::load_page(store, query, &|| true)?.ok_or_else(|| "cancelled".into())
 }
 
 fn discard_inactive_records(flow: &mut FlowEngine, keep: Option<u32>) {
@@ -229,48 +169,141 @@ fn discard_purged_record(store: &Store, flow: &mut FlowEngine) {
 /// rereading payloads or cloning each card's full text.
 #[derive(Default)]
 struct HistoryPage {
+    loader: Option<history_loader::Loader>,
+    generation: u64,
     query: Option<HistoryQuery>,
     cards: Arc<[CardView]>,
     has_next: bool,
     error: Option<String>,
     invalidated: bool,
+    loading: bool,
+    detail_content: Option<(u32, Arc<str>)>,
+    detail_error: Option<(u32, String)>,
 }
 
 impl HistoryPage {
     fn invalidate(&mut self) {
         self.invalidated = true;
+        if let Some(loader) = &self.loader {
+            self.generation = loader.cancel();
+        }
     }
 
-    fn refresh(&mut self, store: &Store, query: &HistoryQuery, active: bool) {
+    fn refresh(&mut self, _store: &Store, query: &HistoryQuery, active: bool) {
         if !active {
-            *self = Self::default();
+            if self.query.is_some() || self.loading {
+                if let Some(loader) = &self.loader {
+                    self.generation = loader.cancel();
+                }
+            }
+            self.query = None;
+            self.cards = Arc::default();
+            self.has_next = false;
+            self.error = None;
+            self.loading = false;
+            self.detail_content = None;
+            self.detail_error = None;
             return;
         }
-        if !self.invalidated && self.query.as_ref() == Some(query) {
-            return;
+        if self.invalidated || self.query.as_ref() != Some(query) {
+            self.cards = Arc::default();
+            self.has_next = false;
+            self.error = None;
+            self.loading = true;
+            if let Some(loader) = &self.loader {
+                self.generation = loader.request(query);
+            }
+            self.query = Some(query.clone());
+            self.invalidated = false;
         }
-        let cached_images = self
-            .cards
-            .iter()
-            .filter_map(|card| match &card.payload {
-                CardPayloadView::Image { handle, .. } => Some((card.sequence, handle.clone())),
-                _ => None,
-            })
-            .collect();
-        match load_history_page(store, query, &cached_images) {
-            Ok((cards, has_next)) => {
+    }
+
+    fn receive(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let Some(result) = self
+                .loader
+                .as_ref()
+                .and_then(|loader| loader.results.try_recv().ok())
+            else {
+                break;
+            };
+            let initial_cards = matches!(result, history_loader::ResultEvent::Cards { .. });
+            changed |= self.apply(result);
+            // Publish text cards independently before consuming decoded images.
+            if changed && initial_cards {
+                break;
+            }
+        }
+        changed
+    }
+
+    fn apply(&mut self, result: history_loader::ResultEvent) -> bool {
+        if self.query.is_none() || self.invalidated {
+            return false;
+        }
+        match result {
+            history_loader::ResultEvent::Cards {
+                generation,
+                cards,
+                has_next,
+            } if generation == self.generation => {
                 self.cards = cards.into();
                 self.has_next = has_next;
+                self.loading = false;
                 self.error = None;
+                true
             }
-            Err(error) => {
-                self.cards = Arc::default();
-                self.has_next = false;
-                self.error = Some(error);
+            history_loader::ResultEvent::Thumbnail {
+                generation,
+                sequence,
+                hash,
+                handle,
+            } if generation == self.generation => {
+                if let Some(index) = self
+                    .cards
+                    .iter()
+                    .position(|c| c.sequence == sequence && c.content_hash == hash)
+                {
+                    if let CardPayloadView::Image { handle: slot, .. } =
+                        &mut Arc::make_mut(&mut self.cards)[index].payload
+                    {
+                        *slot = Some(handle);
+                        return true;
+                    }
+                }
+                false
             }
+            history_loader::ResultEvent::Error {
+                generation,
+                message,
+            } if generation == self.generation => {
+                self.loading = false;
+                self.error = Some(message);
+                true
+            }
+            history_loader::ResultEvent::ThumbnailUnavailable {
+                generation,
+                sequence,
+                hash,
+            } if generation == self.generation => {
+                if let Some(index) = self
+                    .cards
+                    .iter()
+                    .position(|c| c.sequence == sequence && c.content_hash == hash)
+                {
+                    if let CardPayloadView::Image {
+                        thumbnail_failed, ..
+                    } = &mut Arc::make_mut(&mut self.cards)[index].payload
+                    {
+                        *thumbnail_failed = true;
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
-        self.query = Some(query.clone());
-        self.invalidated = false;
     }
 }
 
@@ -300,6 +333,9 @@ fn publish(
         history_query: history_query.clone(),
         history_active,
         history_has_next: history_page.has_next,
+        history_loading: history_page.loading,
+        detail_content: history_page.detail_content.clone(),
+        detail_error: history_page.detail_error.clone(),
         modal_image: if history_active {
             modal_image.clone()
         } else {
@@ -321,6 +357,11 @@ fn publish(
         snap.revision = guard.revision.wrapping_add(1);
         snap.selected = guard.selected;
         *guard = snap;
+        if !history_page.loading {
+            if let Some(loader) = &history_page.loader {
+                loader.acknowledge(history_page.generation);
+            }
+        }
     }
 }
 
@@ -404,7 +445,10 @@ fn run_worker(
         let mut flow = FlowEngine::new();
         let mut history_query = HistoryQuery::default();
         let mut history_active = false;
-        let mut history_page = HistoryPage::default();
+        let mut history_page = HistoryPage {
+            loader: Some(history_loader::Loader::spawn(store_path.clone())),
+            ..HistoryPage::default()
+        };
         let mut modal_image = None;
         let mut tracking = true;
         let mut tracking_ack = 0;
@@ -485,19 +529,43 @@ fn run_worker(
                         };
                         let _ = event_tx.send(WorkerEvent::PastePrepared { request_id, result });
                     }
-                    WorkerCmd::RecopyText { text } => {
-                        let payload = ClipboardPayload::Text(text);
+                    WorkerCmd::RecopyPlainText { sequence } => {
                         status_note =
-                            match write_internal_payload(&mut flow, &payload, write_payload) {
+                            match recopy_plain_text(&mut flow, &store, sequence, write_payload) {
                                 Ok(_) => "已复制为纯文本".into(),
                                 Err(error) => format!("复制失败：{error}"),
                             };
+                    }
+                    WorkerCmd::LoadContent(sequence) => {
+                        history_page.detail_content = None;
+                        history_page.detail_error = None;
+                        if history_active {
+                            match store.load_content(sequence) {
+                                Ok(Some(text)) => {
+                                    history_page.detail_content = Some((sequence, Arc::from(text)))
+                                }
+                                Ok(None) => {
+                                    history_page.detail_error =
+                                        Some((sequence, "记录已不存在".into()))
+                                }
+                                Err(error) => {
+                                    history_page.detail_error =
+                                        Some((sequence, format!("读取内容失败：{error}")))
+                                }
+                            }
+                        }
+                    }
+                    WorkerCmd::UnloadContent => {
+                        history_page.detail_content = None;
+                        history_page.detail_error = None;
                     }
                     WorkerCmd::ClearHistory => {
                         status_note = match store.clear() {
                             Ok(()) => {
                                 history_page.invalidate();
                                 flow.clear();
+                                history_page.detail_content = None;
+                                history_page.detail_error = None;
                                 modal_image = None;
                                 history_query.page = 0;
                                 "历史已清空".into()
@@ -541,6 +609,20 @@ fn run_worker(
                         };
                     }
                     WorkerCmd::DeleteRecord { sequences } => {
+                        if history_page
+                            .detail_content
+                            .as_ref()
+                            .is_some_and(|(sequence, _)| sequences.contains(sequence))
+                        {
+                            history_page.detail_content = None;
+                        }
+                        if history_page
+                            .detail_error
+                            .as_ref()
+                            .is_some_and(|(sequence, _)| sequences.contains(sequence))
+                        {
+                            history_page.detail_error = None;
+                        }
                         if modal_image
                             .as_ref()
                             .is_some_and(|(sequence, _)| sequences.contains(sequence))
@@ -586,7 +668,7 @@ fn run_worker(
                     WorkerCmd::SetHistoryActive(active) => {
                         history_active = active;
                         if !active {
-                            history_page = HistoryPage::default();
+                            history_page.refresh(&store, &history_query, false);
                             modal_image = None;
                         }
                     }
@@ -618,6 +700,8 @@ fn run_worker(
                     }
                 }
             }
+
+            dirty |= history_page.receive();
 
             // Periodic retention purge (default 30 days; honors setting).
             let now = now_ms();
@@ -786,7 +870,7 @@ mod tests {
         SourceConfidence,
     };
 
-    fn text_record(sequence: u32, text: &str, created_at_ms: i64) -> ClipboardRecord {
+    pub(super) fn text_record(sequence: u32, text: &str, created_at_ms: i64) -> ClipboardRecord {
         let payload = ClipboardPayload::Text(text.to_string());
         ClipboardRecord {
             sequence,
@@ -802,6 +886,25 @@ mod tests {
             pinned: false,
             pastes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn plain_copy_preserves_full_text_beyond_preview() {
+        let mut store = Store::open_in_memory().unwrap();
+        let full = format!("{}END", "long unicode 内容".repeat(1000));
+        store.insert_record(&text_record(7, &full, 10_000)).unwrap();
+        let mut flow = FlowEngine::new();
+        assert_eq!(
+            recopy_plain_text(&mut flow, &store, 7, |payload| {
+                assert_eq!(payload, &ClipboardPayload::Text(full.clone()));
+                Ok(42)
+            }),
+            Ok(42)
+        );
+        assert!(recopy_plain_text(&mut flow, &store, 99, |_| panic!(
+            "missing record cannot write"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -981,14 +1084,14 @@ mod tests {
         }
 
         let mut query = HistoryQuery::default();
-        let (first, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        let (first, has_next) = load_history_page(&store, &query).unwrap();
         assert_eq!(first.len(), HISTORY_PAGE_SIZE);
         assert_eq!(first.first().unwrap().sequence, 30);
         assert_eq!(first.last().unwrap().sequence, 6);
         assert!(has_next);
 
         query.page = 1;
-        let (second, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        let (second, has_next) = load_history_page(&store, &query).unwrap();
         assert_eq!(second.len(), 5);
         assert_eq!(second.first().unwrap().sequence, 5);
         assert_eq!(second.last().unwrap().sequence, 1);
@@ -996,167 +1099,80 @@ mod tests {
 
         query.page = 0;
         query.search = "entry-03-X".into();
-        let (matches, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        let (matches, has_next) = load_history_page(&store, &query).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].sequence, 3);
         assert!(!has_next);
 
         query.search.clear();
         query.newest_first = false;
-        let (oldest, has_next) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        let (oldest, has_next) = load_history_page(&store, &query).unwrap();
         assert_eq!(oldest.first().unwrap().sequence, 1);
         assert_eq!(oldest.last().unwrap().sequence, 25);
         assert!(has_next);
     }
 
     #[test]
-    fn status_publication_shares_page_and_full_text_without_reading_history() {
-        let mut store = Store::open_in_memory().unwrap();
-        let text = "large clipboard text ".repeat(100_000);
-        store.insert_record(&text_record(1, &text, 10_000)).unwrap();
-        let shared = SharedUi::default();
-        let flow = FlowEngine::new();
-        let query = HistoryQuery::default();
-        let mut page = HistoryPage::default();
-        let mut publish_status =
-            |tracking,
-             tracking_ack,
-             expanded,
-             modal: &Option<(u32, iced::widget::image::Handle)>| {
-                publish(
-                    &shared,
-                    &store,
-                    &flow,
-                    &query,
-                    true,
-                    &mut page,
-                    modal,
-                    tracking,
-                    tracking_ack,
-                    Retention::default(),
-                    Vec::new(),
-                    expanded,
-                    "status changed".into(),
-                    Hotkey::default(),
-                    Hotkey::Disabled,
-                    None,
-                );
-            };
-        publish_status(true, 0, false, &None);
-        let original = shared.lock().unwrap().clone();
-        let ui_clone = original.clone();
-        assert!(Arc::ptr_eq(&original.cards, &ui_clone.cards));
-        assert_eq!(
-            original.cards[0].full_content.as_ptr(),
-            ui_clone.cards[0].full_content.as_ptr()
-        );
-        assert_eq!(ui_clone.cards[0].full_content, text);
-        let modal = Some((
-            1,
-            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
-        ));
-        publish_status(false, 42, true, &modal);
-        {
-            let current = shared.lock().unwrap();
-            assert!(Arc::ptr_eq(&original.cards, &current.cards));
-            assert!(!current.tracking);
-            assert_eq!(current.tracking_ack, 42);
-            assert!(current.expanded_raw);
-            assert!(current.modal_image.is_some());
-            assert!(current.revision > original.revision);
-        }
-        publish_status(false, 42, false, &None);
-        assert!(Arc::ptr_eq(&original.cards, &shared.lock().unwrap().cards));
-
-        // An unannounced database change stays outside the cached page. This
-        // detects accidental rereads on status-only publications.
-        store
-            .insert_record(&text_record(2, "new record", 20_000))
-            .unwrap();
-        page.refresh(&store, &query, true);
-        assert!(Arc::ptr_eq(&original.cards, &page.cards));
-        page.invalidate();
-        page.refresh(&store, &query, true);
-        assert!(!Arc::ptr_eq(&original.cards, &page.cards));
-        assert_eq!(page.cards[0].sequence, 2);
-    }
-
-    #[test]
-    fn query_replacement_and_inactive_release_do_not_retain_old_pages() {
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .insert_record(&text_record(1, "first", 10_000))
-            .unwrap();
-        store
-            .insert_record(&text_record(2, "second", 20_000))
-            .unwrap();
-        let mut page = HistoryPage::default();
-        let mut query = HistoryQuery::default();
-        page.refresh(&store, &query, true);
-        let old_page = Arc::downgrade(&page.cards);
-        query.search = "first".into();
-        page.refresh(&store, &query, true);
-        assert!(old_page.upgrade().is_none());
-        assert_eq!(page.cards.len(), 1);
-        assert_eq!(page.cards[0].sequence, 1);
-        let current_page = Arc::downgrade(&page.cards);
-        page.refresh(&store, &query, false);
-        assert!(current_page.upgrade().is_none());
-        assert!(page.cards.is_empty());
-        assert!(page.query.is_none());
-        store
-            .insert_record(&text_record(3, "first new", 30_000))
-            .unwrap();
-        page.refresh(&store, &query, true);
-        assert_eq!(page.cards[0].sequence, 3);
-        assert_eq!(page.query.as_ref(), Some(&query));
-    }
-
-    #[test]
-    fn inactive_history_releases_the_published_page() {
+    fn loading_page_rejects_old_results_and_releases_inactive_cards() {
         let mut store = Store::open_in_memory().unwrap();
         store
             .insert_record(&text_record(1, "saved", 10_000))
             .unwrap();
-        let shared = SharedUi::default();
-        let flow = FlowEngine::new();
         let query = HistoryQuery::default();
-        let mut history_page = HistoryPage::default();
-        let modal = Some((
-            1,
-            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
-        ));
-        let mut publish_with_active = |active| {
-            publish(
-                &shared,
-                &store,
-                &flow,
-                &query,
-                active,
-                &mut history_page,
-                &modal,
-                true,
-                0,
-                Retention::default(),
-                Vec::new(),
-                false,
-                String::new(),
-                Hotkey::default(),
-                Hotkey::default(),
-                None,
-            );
+        let (cards, has_next) = load_history_page(&store, &query).unwrap();
+        let mut page = HistoryPage {
+            generation: 2,
+            query: Some(query.clone()),
+            loading: true,
+            ..HistoryPage::default()
         };
+        assert!(!page.apply(history_loader::ResultEvent::Cards {
+            generation: 1,
+            cards: cards.clone(),
+            has_next
+        }));
+        assert!(page.loading);
+        assert!(page.apply(history_loader::ResultEvent::Cards {
+            generation: 2,
+            cards,
+            has_next
+        }));
+        assert!(!page.loading);
+        let old = Arc::downgrade(&page.cards);
+        page.refresh(&store, &query, false);
+        assert!(old.upgrade().is_none());
+        assert!(!page.apply(history_loader::ResultEvent::Error {
+            generation: 2,
+            message: "stale".into()
+        }));
+        assert!(page.error.is_none());
+    }
 
-        publish_with_active(true);
-        assert_eq!(shared.lock().unwrap().cards.len(), 1);
-        let old_page = Arc::downgrade(&shared.lock().unwrap().cards);
-        publish_with_active(false);
-        let snap = shared.lock().unwrap();
-        assert!(!snap.history_active);
-        assert!(snap.cards.is_empty());
-        assert!(snap.modal_image.is_none());
-        assert!(old_page.upgrade().is_none());
-        assert_eq!(snap.record_count, 1);
+    #[test]
+    fn status_only_publication_shares_bounded_cards() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .insert_record(&text_record(1, &"large text ".repeat(100_000), 10_000))
+            .unwrap();
+        let query = HistoryQuery::default();
+        let (cards, _) = load_history_page(&store, &query).unwrap();
+        assert!(cards[0].content_excerpt.chars().count() <= 512);
+        let mut page = HistoryPage {
+            query: Some(query.clone()),
+            cards: cards.into(),
+            ..HistoryPage::default()
+        };
+        let old = page.cards.clone();
+        page.refresh(&store, &query, true);
+        assert!(Arc::ptr_eq(&old, &page.cards));
+        page.invalidate();
+        assert!(!page.apply(history_loader::ResultEvent::Error {
+            generation: 0,
+            message: "stale".into()
+        }));
+        page.refresh(&store, &query, true);
+        assert!(page.loading);
+        assert!(page.cards.is_empty());
     }
 
     #[test]
@@ -1179,8 +1195,7 @@ mod tests {
             store.insert_record(&record).unwrap();
         }
 
-        let (cards, has_next) =
-            load_history_page(&store, &HistoryQuery::default(), &HashMap::new()).unwrap();
+        let (cards, has_next) = load_history_page(&store, &HistoryQuery::default()).unwrap();
         let grouped = cards.iter().find(|card| card.sequence == 2).unwrap();
         assert_eq!(grouped.raw_count, 3);
         assert_eq!(grouped.raw_sequences, vec![2, 3, 4]);
@@ -1233,7 +1248,7 @@ mod tests {
             (HistoryFilter::Image, 5),
         ] {
             query.filter = filter;
-            let (cards, _) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+            let (cards, _) = load_history_page(&store, &query).unwrap();
             assert_eq!(
                 cards.iter().map(|card| card.sequence).collect::<Vec<_>>(),
                 [expected]
@@ -1241,14 +1256,14 @@ mod tests {
         }
         query.filter = HistoryFilter::All;
         query.pinned_only = true;
-        let (cards, _) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        let (cards, _) = load_history_page(&store, &query).unwrap();
         assert_eq!(
             cards.iter().map(|card| card.sequence).collect::<Vec<_>>(),
             [2]
         );
         query.pinned_only = false;
         query.search = "target-app".into();
-        let (cards, _) = load_history_page(&store, &query, &HashMap::new()).unwrap();
+        let (cards, _) = load_history_page(&store, &query).unwrap();
         assert_eq!(
             cards.iter().map(|card| card.sequence).collect::<Vec<_>>(),
             [1]

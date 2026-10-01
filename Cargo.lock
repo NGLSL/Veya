@@ -3827,6 +3827,7 @@ dependencies = [
  "iced",
  "iced_graphics",
  "image 0.25.10",
+ "png 0.18.1",
  "veya-core",
  "veya-storage",
  "veya-windows",

@@ -194,7 +194,11 @@ impl App {
         // The worker owns filtering, sorting, and paging. The UI only receives
         // the bounded page, so never rebuild a second full history projection
         // here.
-        self.state.cards.iter().collect()
+        if self.history_query_pending() {
+            Vec::new()
+        } else {
+            self.state.cards.iter().collect()
+        }
     }
 
     fn history_pagination(&self) -> Element<'_, Message> {
@@ -257,6 +261,7 @@ impl App {
             .filter(|seq| visible.iter().any(|card| card.sequence == *seq))
             .or_else(|| visible.first().map(|card| card.sequence));
         if current != next {
+            self.unload_content();
             self.state.selected = next;
             self.detail_menu_open = false;
             self.unload_full_image();
@@ -451,7 +456,11 @@ fn card_menu_origin(cursor: iced::Point, window: iced::Size) -> iced::Point {
 }
 
 pub(super) fn card_leading_visual<'a>(card: &'a CardView, size: f32) -> Element<'a, Message> {
-    if let crate::capture::CardPayloadView::Image { handle, .. } = &card.payload {
+    if let crate::capture::CardPayloadView::Image {
+        handle: Some(handle),
+        ..
+    } = &card.payload
+    {
         let inner = (size - 4.0).max(1.0);
         container(
             iced::widget::image(handle.clone())

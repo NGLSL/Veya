@@ -23,6 +23,11 @@
 .scratch/veya-quick-paste/validation/*.json
 .scratch/veya-quick-paste/validation/*.png
 .scratch/veya-quick-paste/validation/*.exe
+.scratch/veya-code-optimization/validation/appdata*/
+.scratch/veya-code-optimization/validation/__pycache__/
+.scratch/veya-code-optimization/validation/*.json
+.scratch/veya-code-optimization/validation/*.png
+.scratch/veya-code-optimization/validation/*.exe
 
 # OS
 Thumbs.db

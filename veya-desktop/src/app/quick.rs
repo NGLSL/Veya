@@ -58,6 +58,7 @@ impl App {
     pub(super) fn show_quick(&mut self, target: Option<PasteTarget>) -> Task<Message> {
         let generation = self.advance_window_generation();
         self.cancel_hotkey_recording();
+        self.unload_content();
         self.unload_full_image();
         if self.quick.is_none() {
             self.quick = Some(QuickPanel {
@@ -607,6 +608,7 @@ mod tests {
             cursor_position: iced::Point::ORIGIN,
             window_size: iced::Size::new(1080.0, 700.0),
             content_modal_for: None,
+            requested_content: None,
             clear_history_confirmation_open: false,
             copied_tick: 0,
             show_qrcode: false,
@@ -615,6 +617,85 @@ mod tests {
             chrome_sync_attempts: 0,
             updates: UpdateCheck::default(),
         }
+    }
+
+    fn ready_text_app() -> (App, std::sync::mpsc::Receiver<WorkerCmd>) {
+        let mut app = isolated_app();
+        app.search.clear();
+        app.filter = Filter::All;
+        app.pinned_only = false;
+        app.sort_order = SortOrder::Newest;
+        app.history_page = 0;
+        app.state.history_query = app.history_query();
+        app.state.history_active = true;
+        let summary = veya_core::HistorySummary {
+            representative: veya_core::HistoryRecord {
+                sequence: 1,
+                content: format!("{}TAIL", "中".repeat(1_000)),
+                payload: veya_core::HistoryPayload::Text,
+                content_hash: "one".into(),
+                source_app: "editor.exe".into(),
+                source_window: "source".into(),
+                source_confidence: veya_core::SourceConfidence::Exact,
+                created_at_ms: 1,
+                pinned: false,
+                pastes: Vec::new(),
+            },
+            raw_sequences: vec![1],
+            used_in: Vec::new(),
+            last_created_at_ms: 1,
+        };
+        app.state.cards = vec![crate::capture::card_view_from_summary(&summary, None)].into();
+        app.state.selected = Some(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.worker.cmd_tx = tx;
+        (app, rx)
+    }
+
+    #[test]
+    fn plain_copy_requests_original_record_without_using_excerpt() {
+        let (mut app, commands) = ready_text_app();
+        assert!(!app.state.cards[0].content_excerpt.contains("TAIL"));
+        let _ = app.update(Message::CopyPlainText(1));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCmd::RecopyPlainText { sequence: 1 })
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn detail_load_is_once_per_selection_and_rejects_late_old_content() {
+        let (mut app, commands) = ready_text_app();
+        app.sync_detail_content();
+        assert!(matches!(commands.try_recv(), Ok(WorkerCmd::LoadContent(1))));
+        app.sync_detail_content();
+        assert!(commands.try_recv().is_err());
+        app.state.detail_content = Some((99, std::sync::Arc::from("old tail")));
+        app.sync_detail_content();
+        assert!(app.full_content_for(1).is_none());
+        assert!(app.state.detail_content.is_none());
+        let full = format!("{}TAIL", "中".repeat(1_000));
+        app.state.detail_content = Some((1, std::sync::Arc::from(full.clone())));
+        assert_eq!(app.full_content_for(1), Some(full.as_str()));
+        let _ = app.show_quick(None);
+        assert!(app.state.detail_content.is_none());
+        assert!(app.requested_content.is_none());
+        app.sync_detail_content();
+        assert!(!commands
+            .try_iter()
+            .any(|command| matches!(command, WorkerCmd::LoadContent(_))));
+    }
+
+    #[test]
+    fn loading_query_cannot_copy_or_expand_previous_cards() {
+        let (mut app, commands) = ready_text_app();
+        app.state.history_loading = true;
+        let _ = app.update(Message::CopyPlainText(1));
+        let _ = app.update(Message::Copy(1));
+        let _ = app.update(Message::OpenContentModal(1));
+        assert!(commands.try_recv().is_err());
+        assert!(app.content_modal_for.is_none());
     }
 
     #[test]

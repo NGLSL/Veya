@@ -13,7 +13,9 @@ pub mod flow;
 pub mod model;
 pub mod search;
 
-pub use aggregate::{HistoryCard, UsedInSummary};
+pub use aggregate::{
+    HistoryAggregator, HistoryCard, HistoryPayload, HistoryRecord, HistorySummary, UsedInSummary,
+};
 pub use events::{
     ClipboardChange, InternalClipboardWrite, PasteConfidence, PasteMethod, PasteTrigger,
     SourceConfidence,

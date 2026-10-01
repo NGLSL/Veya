@@ -6,8 +6,31 @@ use std::{collections::HashMap, fmt::Write as _, path::Path};
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use veya_core::{
-    ClipboardPayload, ClipboardRecord, PasteMethod, PasteTriggerRecord, SourceConfidence,
+    ClipboardPayload, ClipboardRecord, HistoryPayload, HistoryRecord, PasteMethod,
+    PasteTriggerRecord, SourceConfidence,
 };
+
+/// Persisted list image, bounded to the UI thumbnail edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl Thumbnail {
+    fn valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width <= 128
+            && self.height <= 128
+            && self
+                .width
+                .checked_mul(self.height)
+                .and_then(|n| n.checked_mul(4))
+                .is_some_and(|n| n as usize == self.rgba.len())
+    }
+}
 
 pub struct Store {
     conn: Connection,
@@ -69,6 +92,13 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_paste_record ON paste_trigger(clipboard_record_id);
             CREATE INDEX IF NOT EXISTS idx_record_hash ON clipboard_record(content_hash);
             CREATE INDEX IF NOT EXISTS idx_record_created ON clipboard_record(created_at_ms);
+            CREATE TABLE IF NOT EXISTS image_thumbnail (
+                sequence INTEGER PRIMARY KEY REFERENCES clipboard_record(sequence) ON DELETE CASCADE,
+                content_hash TEXT NOT NULL,
+                width INTEGER NOT NULL CHECK(width BETWEEN 1 AND 128),
+                height INTEGER NOT NULL CHECK(height BETWEEN 1 AND 128),
+                rgba BLOB NOT NULL CHECK(length(rgba) = width * height * 4)
+            );
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -160,6 +190,10 @@ impl Store {
                 height,
             ],
         )?;
+        tx.execute(
+            "DELETE FROM image_thumbnail WHERE sequence = ?1 AND (content_hash != ?2 OR ?3 != 'image')",
+            params![i64::from(rec.sequence), rec.content_hash, rec.payload.kind()],
+        )?;
         // Keep payload and paste associations atomic across updates.
         tx.execute(
             "DELETE FROM paste_trigger WHERE clipboard_record_id = ?1",
@@ -249,6 +283,130 @@ impl Store {
 
         self.load_pastes_for_records(&mut records)?;
         Ok(records)
+    }
+
+    /// Load searchable history metadata without transferring original image BLOBs.
+    /// Full text is owned once and can be discarded after matching/preview creation.
+    pub fn load_history_page(
+        &self,
+        cursor: Option<(i64, u32)>,
+        limit: usize,
+        newest_first: bool,
+    ) -> rusqlite::Result<Vec<HistoryRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let direction = if newest_first { "DESC" } else { "ASC" };
+        let comparison = if newest_first { "<" } else { ">" };
+        let sql = format!(
+            r#"
+            SELECT sequence, content_type, content, content_hash,
+                   source_app, source_pid, source_window, source_confidence, created_at_ms, pinned,
+                   CASE WHEN content_type = 'files' THEN payload ELSE NULL END,
+                   image_width, image_height, length(payload)
+            FROM clipboard_record
+            WHERE (?1 IS NULL OR created_at_ms {comparison} ?1
+                   OR (created_at_ms = ?1 AND sequence {comparison} ?2))
+            ORDER BY created_at_ms {direction}, sequence {direction} LIMIT ?3
+        "#
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut records = stmt
+            .query_map(
+                params![
+                    cursor.map(|c| c.0),
+                    cursor.map(|c| i64::from(c.1)),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                decode_history_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let sequences: Vec<u32> = records.iter().map(|r| r.sequence).collect();
+        let mut pastes = self.load_pastes(&sequences)?;
+        for record in &mut records {
+            record.pastes = pastes.remove(&record.sequence).unwrap_or_default();
+        }
+        Ok(records)
+    }
+
+    /// Read canonical full display content without materializing original image bytes.
+    pub fn load_content(&self, sequence: u32) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT sequence, content_type, content, content_hash,
+                       source_app, source_pid, source_window, source_confidence, created_at_ms, pinned,
+                       CASE WHEN content_type = 'files' THEN payload ELSE NULL END,
+                       image_width, image_height, length(payload)
+                FROM clipboard_record WHERE sequence = ?1
+                "#,
+                params![i64::from(sequence)],
+                |row| decode_history_record(row).map(|record| record.content),
+            )
+            .optional()
+    }
+
+    pub fn load_thumbnail(
+        &self,
+        sequence: u32,
+        content_hash: &str,
+    ) -> rusqlite::Result<Option<Thumbnail>> {
+        let thumbnail = self
+            .conn
+            .query_row(
+                r#"
+            SELECT t.width, t.height, t.rgba FROM image_thumbnail t
+            JOIN clipboard_record r ON r.sequence = t.sequence
+            WHERE t.sequence = ?1 AND t.content_hash = ?2 AND r.content_hash = ?2
+                AND r.content_type = 'image'
+        "#,
+                params![i64::from(sequence), content_hash],
+                |row| {
+                    // Derived cache corruption is a miss; SQL/connection failures still propagate.
+                    let decode = || -> rusqlite::Result<Thumbnail> {
+                        Ok(Thumbnail {
+                            width: row.get(0)?,
+                            height: row.get(1)?,
+                            rgba: row.get(2)?,
+                        })
+                    };
+                    Ok(decode().ok().filter(Thumbnail::valid))
+                },
+            )
+            .optional()?;
+        Ok(thumbnail.flatten())
+    }
+
+    /// Ignore results generated for deleted/replaced records; never cache original pixels.
+    pub fn save_thumbnail(
+        &mut self,
+        sequence: u32,
+        content_hash: &str,
+        thumbnail: &Thumbnail,
+    ) -> rusqlite::Result<()> {
+        if !thumbnail.valid() {
+            return Err(invalid_payload(
+                "invalid thumbnail dimensions or RGBA length",
+            ));
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO image_thumbnail (sequence, content_hash, width, height, rgba)
+            SELECT sequence, content_hash, ?3, ?4, ?5 FROM clipboard_record
+            WHERE sequence = ?1 AND content_hash = ?2 AND content_type = 'image'
+            ON CONFLICT(sequence) DO UPDATE SET content_hash = excluded.content_hash,
+                width = excluded.width, height = excluded.height, rgba = excluded.rgba
+        "#,
+            params![
+                i64::from(sequence),
+                content_hash,
+                thumbnail.width,
+                thumbnail.height,
+                thumbnail.rgba
+            ],
+        )?;
+        Ok(())
     }
 
     /// Load one raw clipboard record and its paste associations by sequence.
@@ -343,14 +501,22 @@ impl Store {
             return Ok(());
         }
 
-        let positions: HashMap<u32, usize> = records
+        let sequences: Vec<u32> = records.iter().map(|record| record.sequence).collect();
+        let mut pastes = self.load_pastes(&sequences)?;
+        for record in records {
+            record.pastes = pastes.remove(&record.sequence).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    fn load_pastes(
+        &self,
+        sequences: &[u32],
+    ) -> rusqlite::Result<HashMap<u32, Vec<PasteTriggerRecord>>> {
+        let mut result: HashMap<u32, Vec<PasteTriggerRecord>> = HashMap::new();
+        let sequences: Vec<i64> = sequences
             .iter()
-            .enumerate()
-            .map(|(index, record)| (record.sequence, index))
-            .collect();
-        let sequences: Vec<i64> = records
-            .iter()
-            .map(|record| i64::from(record.sequence))
+            .map(|sequence| i64::from(*sequence))
             .collect();
 
         // Keep the association query below SQLite's variable limit even if a
@@ -388,12 +554,10 @@ impl Store {
             })?;
             for item in pastes {
                 let (sequence, paste) = item?;
-                if let Some(&index) = positions.get(&sequence) {
-                    records[index].pastes.push(paste);
-                }
+                result.entry(sequence).or_default().push(paste);
             }
         }
-        Ok(())
+        Ok(result)
     }
 
     pub fn delete_record(&mut self, sequence: u32) -> rusqlite::Result<usize> {
@@ -501,6 +665,61 @@ fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardRecord> {
         content_hash: row.get(3)?,
         source_app: row.get(4)?,
         source_pid: row.get::<_, i64>(5)? as u32,
+        source_window: row.get(6)?,
+        source_confidence: parse_confidence(&row.get::<_, String>(7)?),
+        created_at_ms: row.get(8)?,
+        pinned: row.get::<_, i64>(9)? != 0,
+        pastes: Vec::new(),
+    })
+}
+
+fn decode_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRecord> {
+    let kind: String = row.get(1)?;
+    let mut content: String = row.get(2)?;
+    let payload = match kind.as_str() {
+        "text" => HistoryPayload::Text,
+        "files" => {
+            let decoded = decode_payload("files", &content, row.get(10)?, None, None)?;
+            content = decoded.display_text();
+            let ClipboardPayload::Files(paths) = decoded else {
+                unreachable!()
+            };
+            HistoryPayload::Files(paths)
+        }
+        "image" => {
+            let width = row
+                .get::<_, Option<i64>>(11)?
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0);
+            let height = row
+                .get::<_, Option<i64>>(12)?
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0);
+            let bytes = row
+                .get::<_, Option<i64>>(13)?
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0);
+            match (width, height, bytes) {
+                (Some(width), Some(height), Some(encoded_bytes)) => {
+                    // Match raw payload display text even for legacy inconsistent content.
+                    content = format!("图片 {width} × {height}");
+                    HistoryPayload::Image {
+                        width,
+                        height,
+                        encoded_bytes,
+                    }
+                }
+                _ => return Err(invalid_payload("invalid image payload")),
+            }
+        }
+        _ => return Err(invalid_payload("unknown clipboard payload type")),
+    };
+    Ok(HistoryRecord {
+        sequence: row.get::<_, i64>(0)? as u32,
+        content,
+        payload,
+        content_hash: row.get(3)?,
+        source_app: row.get(4)?,
         source_window: row.get(6)?,
         source_confidence: parse_confidence(&row.get::<_, String>(7)?),
         created_at_ms: row.get(8)?,
@@ -629,6 +848,256 @@ mod tests {
                 confidence: veya_core::PasteConfidence::HotkeyObserved,
                 triggered_at_ms: 2_000 + i64::from(seq),
             }],
+        }
+    }
+
+    #[test]
+    fn history_projection_preserves_typed_metadata_fulltext_and_cursor_order() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut text = rec(1);
+        text.created_at_ms = 100;
+        text.payload = ClipboardPayload::Text(format!("{}OUTSIDE_PREVIEW", "long ".repeat(2000)));
+        text.pinned = true;
+        text.source_confidence = SourceConfidence::Likely;
+        let mut files = rec(2);
+        files.created_at_ms = 100;
+        files.payload = ClipboardPayload::Files(vec![r"C:\临时\a.txt".into()]);
+        let mut image = rec(3);
+        image.created_at_ms = 200;
+        image.payload = ClipboardPayload::Image {
+            png: vec![7; 1024 * 1024],
+            width: 2048,
+            height: 2048,
+        };
+        for r in [&text, &files, &image] {
+            store.insert_record(r).unwrap();
+        }
+        let raw = store.load_records_page(None, 10, false).unwrap();
+        let projected = store.load_history_page(None, 10, false).unwrap();
+        for (raw, p) in raw.iter().zip(&projected) {
+            assert_eq!(p.sequence, raw.sequence);
+            assert_eq!(p.content, raw.content);
+            assert_eq!(p.content_hash, raw.content_hash);
+            assert_eq!(p.source_app, raw.source_app);
+            assert_eq!(p.source_window, raw.source_window);
+            assert_eq!(p.source_confidence, raw.source_confidence);
+            assert_eq!(p.pinned, raw.pinned);
+            assert_eq!(p.pastes, raw.pastes);
+        }
+        assert_eq!(projected[0].payload, HistoryPayload::Text);
+        assert_eq!(
+            projected[1].payload,
+            HistoryPayload::Files(vec![r"C:\临时\a.txt".into()])
+        );
+        assert_eq!(
+            projected[2].payload,
+            HistoryPayload::Image {
+                width: 2048,
+                height: 2048,
+                encoded_bytes: 1024 * 1024
+            }
+        );
+        assert!(projected[0].content.ends_with("OUTSIDE_PREVIEW"));
+        assert_eq!(
+            store.load_content(1).unwrap().unwrap(),
+            projected[0].content
+        );
+        assert!(store.load_content(99).unwrap().is_none());
+        for (newest_first, expected) in [(false, vec![1, 2, 3]), (true, vec![3, 2, 1])] {
+            let mut cursor = None;
+            let mut actual = Vec::new();
+            loop {
+                let page = store.load_history_page(cursor, 1, newest_first).unwrap();
+                let Some(r) = page.first() else { break };
+                actual.push(r.sequence);
+                cursor = Some((r.created_at_ms, r.sequence));
+            }
+            assert_eq!(actual, expected);
+        }
+        assert!(store.load_history_page(None, 0, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn thumbnail_cache_is_bounded_identity_checked_and_cascades() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut image = rec(1);
+        image.payload = ClipboardPayload::Image {
+            png: vec![1, 2, 3],
+            width: 2048,
+            height: 2048,
+        };
+        store.insert_record(&image).unwrap();
+        let thumbnail = Thumbnail {
+            width: 128,
+            height: 64,
+            rgba: vec![2; 128 * 64 * 4],
+        };
+        store.save_thumbnail(1, "h1", &thumbnail).unwrap();
+        assert_eq!(
+            store.load_thumbnail(1, "h1").unwrap(),
+            Some(thumbnail.clone())
+        );
+        assert!(store.load_thumbnail(1, "other").unwrap().is_none());
+        for invalid in [
+            Thumbnail {
+                width: 129,
+                height: 1,
+                rgba: vec![0; 129 * 4],
+            },
+            Thumbnail {
+                width: 0,
+                height: 1,
+                rgba: vec![],
+            },
+            Thumbnail {
+                width: 2,
+                height: 2,
+                rgba: vec![0; 15],
+            },
+            Thumbnail {
+                width: u32::MAX,
+                height: u32::MAX,
+                rgba: vec![],
+            },
+        ] {
+            assert!(store.save_thumbnail(1, "h1", &invalid).is_err());
+        }
+        image.content_hash = "new".into();
+        store.insert_record(&image).unwrap();
+        store.save_thumbnail(1, "h1", &thumbnail).unwrap();
+        assert!(store.load_thumbnail(1, "h1").unwrap().is_none());
+        assert!(store.load_thumbnail(1, "new").unwrap().is_none());
+        store.save_thumbnail(1, "new", &thumbnail).unwrap();
+        store.delete_record(1).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM image_thumbnail", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store.insert_record(&rec(2)).unwrap();
+        store.save_thumbnail(2, "h2", &thumbnail).unwrap();
+        assert!(store.load_thumbnail(2, "h2").unwrap().is_none());
+        store.save_thumbnail(999, "missing", &thumbnail).unwrap();
+    }
+
+    #[test]
+    fn generated_thumbnail_survives_store_reopen_without_backfill() {
+        let path = std::env::temp_dir().join(format!(
+            "veya-thumbnail-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut image = rec(1);
+        image.payload = ClipboardPayload::Image {
+            png: vec![1, 2, 3],
+            width: 100,
+            height: 100,
+        };
+        let thumbnail = Thumbnail {
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        };
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.insert_record(&image).unwrap();
+            assert!(store.load_thumbnail(1, "h1").unwrap().is_none());
+            store.save_thumbnail(1, "h1", &thumbnail).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.load_thumbnail(1, "h1").unwrap(), Some(thumbnail));
+            assert_eq!(
+                store.load_record(1).unwrap().unwrap().payload,
+                image.payload
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn lazy_content_canonicalizes_inconsistent_legacy_files_and_image_labels() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut files = rec(1);
+        files.payload = ClipboardPayload::Files(vec![r"C:\临时\real.txt".into()]);
+        let mut image = rec(2);
+        image.payload = ClipboardPayload::Image {
+            png: vec![1, 2, 3],
+            width: 2048,
+            height: 1024,
+        };
+        for record in [&files, &image] {
+            store.insert_record(record).unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE clipboard_record SET content = 'old inconsistent label'",
+                [],
+            )
+            .unwrap();
+        for sequence in [1, 2] {
+            let raw = store.load_record(sequence).unwrap().unwrap();
+            let content = store.load_content(sequence).unwrap().unwrap();
+            assert_eq!(content, raw.content);
+            assert_ne!(content, "old inconsistent label");
+        }
+    }
+
+    #[test]
+    fn corrupt_derived_thumbnail_is_a_cache_miss() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut image = rec(1);
+        image.payload = ClipboardPayload::Image {
+            png: vec![1, 2, 3],
+            width: 128,
+            height: 128,
+        };
+        store.insert_record(&image).unwrap();
+        let thumbnail = Thumbnail {
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        };
+        store.save_thumbnail(1, "h1", &thumbnail).unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        for corrupt in ["width = -1", "rgba = 'abcd'", "rgba = X'00'"] {
+            store.save_thumbnail(1, "h1", &thumbnail).unwrap();
+            store
+                .conn
+                .execute(&format!("UPDATE image_thumbnail SET {corrupt}"), [])
+                .unwrap();
+            assert!(store.load_thumbnail(1, "h1").unwrap().is_none());
+            assert_eq!(
+                store.load_record(1).unwrap().unwrap().payload,
+                image.payload
+            );
+        }
+    }
+
+    #[test]
+    fn projection_rejects_the_same_malformed_payloads_as_raw_reads() {
+        let mut store = Store::open_in_memory().unwrap();
+        for (kind, blob, width, height) in [
+            ("image", None, Some(10), Some(10)),
+            ("image", Some(vec![1]), Some(0), Some(10)),
+            ("image", Some(vec![]), Some(10), Some(10)),
+            ("files", Some(b"[]".to_vec()), None, None),
+            ("files", Some(b"bad json".to_vec()), None, None),
+            ("unknown", None, None, None),
+        ] {
+            store.clear().unwrap();
+            store.insert_record(&rec(1)).unwrap();
+            store.conn.execute("UPDATE clipboard_record SET content_type=?1, payload=?2, image_width=?3, image_height=?4",
+                params![kind, blob, width, height]).unwrap();
+            assert!(store.load_record(1).is_err());
+            assert!(store.load_history_page(None, 1, true).is_err());
         }
     }
 
@@ -876,6 +1345,10 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "legacy text");
         assert!(!loaded[0].pinned);
+        let projection = store.load_history_page(None, 25, true).unwrap();
+        assert_eq!(projection[0].content, "legacy text");
+        assert_eq!(projection[0].payload, HistoryPayload::Text);
+        assert!(store.load_thumbnail(42, "h42").unwrap().is_none());
     }
 
     #[test]

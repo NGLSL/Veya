@@ -1,6 +1,6 @@
 //! Display helpers. Confidence marks come from `SourceConfidence` — never stored in exe names.
 
-use veya_core::{ClipboardPayload, SourceConfidence};
+use veya_core::{ClipboardPayload, HistoryPayload, SourceConfidence};
 
 /// Coarse clipboard content class for list icons and filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +35,11 @@ impl ContentKind {
 }
 
 /// Classify from the captured format. Only actual text content uses heuristics.
-pub fn payload_kind(payload: &ClipboardPayload) -> ContentKind {
+pub fn history_kind(payload: &HistoryPayload, content: &str) -> ContentKind {
     match payload {
-        ClipboardPayload::Text(text) => content_kind(text),
-        ClipboardPayload::Files(_) => ContentKind::File,
-        ClipboardPayload::Image { .. } => ContentKind::Image,
+        HistoryPayload::Text => content_kind(content),
+        HistoryPayload::Files(_) => ContentKind::File,
+        HistoryPayload::Image { .. } => ContentKind::Image,
     }
 }
 
@@ -173,29 +173,31 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{payload_kind, ContentKind};
-    use veya_core::ClipboardPayload;
+    use super::{history_kind, ContentKind};
+    use veya_core::HistoryPayload;
 
     #[test]
     fn payload_kind_uses_real_clipboard_format_and_does_not_guess_from_paths() {
         assert_eq!(
-            payload_kind(&ClipboardPayload::Text(
-                r"C:\Users\admin\Pictures\photo.png".into()
-            )),
+            history_kind(&HistoryPayload::Text, r"C:\Users\admin\Pictures\photo.png"),
             ContentKind::Text
         );
         assert_eq!(
-            payload_kind(&ClipboardPayload::Files(vec![
-                r"C:\Users\admin\Pictures\photo.png".into()
-            ])),
+            history_kind(
+                &HistoryPayload::Files(vec![r"C:\Users\admin\Pictures\photo.png".into()]),
+                ""
+            ),
             ContentKind::File
         );
         assert_eq!(
-            payload_kind(&ClipboardPayload::Image {
-                png: vec![137, 80, 78, 71],
-                width: 10,
-                height: 20,
-            }),
+            history_kind(
+                &HistoryPayload::Image {
+                    encoded_bytes: 4,
+                    width: 10,
+                    height: 20,
+                },
+                ""
+            ),
             ContentKind::Image
         );
     }

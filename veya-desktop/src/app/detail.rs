@@ -3,6 +3,14 @@ use iced::widget::column;
 
 impl App {
     pub(super) fn detail_panel(&self) -> Element<'_, Message> {
+        if self.history_query_pending() {
+            return container(meta("正在加载当前记录…").color(theme::MUTED))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into();
+        }
         let Some(seq) = self.state.selected else {
             return container(
                 column![
@@ -77,8 +85,12 @@ impl App {
             card.kind,
             ContentKind::Text | ContentKind::Link | ContentKind::Code
         );
-        let url = card.full_content.trim().to_string();
-        let (preview, has_more) = detail_content_preview(&card.full_content);
+        let full_content = self.full_content_for(card.sequence);
+        let content = full_content.unwrap_or(&card.content_excerpt);
+        let url = full_content.map(|content| content.trim().to_string());
+        let (preview, preview_has_more) = detail_content_preview(content);
+        let has_more =
+            preview_has_more || card.content_chars > card.content_excerpt.chars().count();
         let mut actions = row![].spacing(6);
 
         if is_link {
@@ -91,7 +103,7 @@ impl App {
                     .spacing(5)
                     .align_y(Alignment::Center),
                 )
-                .on_press(Message::OpenLink(url.clone()))
+                .on_press_maybe(url.map(Message::OpenLink))
                 .style(theme::action_button)
                 .padding(pad(6.0, 10.0, 6.0, 10.0)),
             );
@@ -107,7 +119,7 @@ impl App {
                     .spacing(5)
                     .align_y(Alignment::Center),
                 )
-                .on_press(Message::WebSearch(card.full_content.clone()))
+                .on_press_maybe(full_content.map(|content| Message::WebSearch(content.to_string())))
                 .style(theme::action_button)
                 .padding(pad(6.0, 10.0, 6.0, 10.0)),
             );
@@ -146,7 +158,7 @@ impl App {
                     .spacing(5)
                     .align_y(Alignment::Center),
                 )
-                .on_press(Message::ToggleQrCode)
+                .on_press_maybe(full_content.map(|_| Message::ToggleQrCode))
                 .style(theme::action_button)
                 .padding(pad(6.0, 10.0, 6.0, 10.0)),
             );
@@ -200,16 +212,18 @@ impl App {
             }
             crate::capture::CardPayloadView::Image {
                 handle,
+                thumbnail_failed,
                 width,
                 height,
                 encoded_bytes,
             } => row![
                 mouse_area(
-                    container(
-                        iced::widget::image(handle.clone())
-                            .width(Length::Fixed(156.0))
-                            .height(Length::Fixed(112.0)),
-                    )
+                    container(thumbnail_or_placeholder(
+                        handle.as_ref(),
+                        *thumbnail_failed,
+                        156.0,
+                        112.0
+                    ),)
                     .width(Length::Fixed(164.0))
                     .height(Length::Fixed(120.0))
                     .center_x(Length::Fixed(164.0))
@@ -298,7 +312,7 @@ impl App {
 
         // Embedded context card (web preview / window title matching Fig 1 without double host)
         let context_info = if matches!(&card.payload, crate::capture::CardPayloadView::Text) {
-            extract_context_preview(&card.full_content, &card.source_window)
+            full_content.and_then(|content| extract_context_preview(content, &card.source_window))
         } else {
             None
         };
@@ -603,22 +617,29 @@ impl App {
         };
         let content_scroll = scrollable(
             container(
-                text(card.full_content.clone())
-                    .size(13)
-                    .line_height(iced::widget::text::LineHeight::Absolute(20.0.into()))
-                    .color(theme::INK)
-                    .font(content_font)
-                    .shaping(text::Shaping::Advanced)
-                    .width(if is_code {
-                        Length::Shrink
-                    } else {
-                        Length::Fill
-                    })
-                    .wrapping(if is_code {
-                        text::Wrapping::None
-                    } else {
-                        text::Wrapping::WordOrGlyph
-                    }),
+                text(self.full_content_for(card.sequence).unwrap_or_else(|| {
+                    self.state
+                        .detail_error
+                        .as_ref()
+                        .filter(|(seq, _)| *seq == card.sequence)
+                        .map(|(_, error)| error.as_str())
+                        .unwrap_or("正在加载完整内容…")
+                }))
+                .size(13)
+                .line_height(iced::widget::text::LineHeight::Absolute(20.0.into()))
+                .color(theme::INK)
+                .font(content_font)
+                .shaping(text::Shaping::Advanced)
+                .width(if is_code {
+                    Length::Shrink
+                } else {
+                    Length::Fill
+                })
+                .wrapping(if is_code {
+                    text::Wrapping::None
+                } else {
+                    text::Wrapping::WordOrGlyph
+                }),
             )
             .width(if is_code {
                 Length::Shrink
@@ -710,7 +731,11 @@ impl App {
 }
 
 fn detail_type_visual<'a>(card: &'a CardView, size: f32) -> Element<'a, Message> {
-    if let crate::capture::CardPayloadView::Image { handle, .. } = &card.payload {
+    if let crate::capture::CardPayloadView::Image {
+        handle: Some(handle),
+        ..
+    } = &card.payload
+    {
         let inner = (size - 4.0).max(1.0);
         container(
             iced::widget::image(handle.clone())
@@ -726,5 +751,34 @@ fn detail_type_visual<'a>(card: &'a CardView, size: f32) -> Element<'a, Message>
         .into()
     } else {
         icons::detail_type_chip::<Message>(card.kind, size).into()
+    }
+}
+
+fn thumbnail_or_placeholder<'a>(
+    handle: Option<&iced::widget::image::Handle>,
+    failed: bool,
+    width: f32,
+    height: f32,
+) -> Element<'a, Message> {
+    if let Some(handle) = handle {
+        iced::widget::image(handle.clone())
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .into()
+    } else {
+        container(
+            meta(if failed {
+                "缩略图暂不可用"
+            } else {
+                "缩略图加载中…"
+            })
+            .size(11)
+            .color(theme::MUTED),
+        )
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(height))
+        .center_x(Length::Fixed(width))
+        .center_y(Length::Fixed(height))
+        .into()
     }
 }
