@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 
 use veya_core::{
     aggregate, payload_hash, ClipboardPayload, ClipboardRecord, FlowEngine, InternalClipboardWrite,
@@ -10,7 +11,7 @@ use veya_core::{
 use veya_storage::Store;
 use veya_windows::hotkey::Hotkey;
 use veya_windows::platform::{enrich_clipboard, enrich_paste, PlatformEvent, WindowSignal};
-use veya_windows::write_payload;
+use veya_windows::{write_payload, ClipboardWriteError};
 
 use crate::capture::{
     card_view_with_cached_image, CardPayloadView, CardView, HistoryQuery, Retention, SharedUi,
@@ -23,6 +24,7 @@ const HISTORY_READ_BATCH: usize = 16;
 
 pub enum WorkerCmd {
     Recopy { sequence: u32 },
+    PreparePaste { sequence: u32, request_id: u64 },
     RecopyText { text: String },
     ClearHistory,
     SetTracking { on: bool, request_id: Option<u64> },
@@ -39,17 +41,26 @@ pub enum WorkerCmd {
     UnloadFullImage,
 }
 
+pub enum WorkerEvent {
+    PastePrepared {
+        request_id: u64,
+        result: Result<u32, String>,
+    },
+}
+
 pub struct WorkerHandle {
     pub cmd_tx: Sender<WorkerCmd>,
+    pub event_rx: Receiver<WorkerEvent>,
 }
 
 pub fn spawn_worker(shared: SharedUi, activate_tx: Sender<WindowSignal>) -> WorkerHandle {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCmd>();
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<WorkerEvent>();
     std::thread::Builder::new()
         .name("veya-capture".into())
-        .spawn(move || run_worker(shared, cmd_rx, activate_tx))
+        .spawn(move || run_worker(shared, cmd_rx, activate_tx, event_tx))
         .expect("spawn capture worker");
-    WorkerHandle { cmd_tx }
+    WorkerHandle { cmd_tx, event_rx }
 }
 
 fn db_path() -> std::path::PathBuf {
@@ -63,8 +74,8 @@ fn db_path() -> std::path::PathBuf {
 fn write_internal_payload(
     flow: &mut FlowEngine,
     payload: &ClipboardPayload,
-    writer: impl FnOnce(&ClipboardPayload) -> Result<u32, String>,
-) -> Result<(), String> {
+    writer: impl FnOnce(&ClipboardPayload) -> Result<u32, ClipboardWriteError>,
+) -> Result<u32, String> {
     let hash = payload_hash(payload);
     // Arm before touching the clipboard. Windows may publish the update with
     // a sequence newer than the value observed inside write_unicode_text.
@@ -75,13 +86,44 @@ fn write_internal_payload(
     match writer(payload) {
         Ok(sequence) => {
             flow.confirm_internal_write(sequence, std::process::id());
-            Ok(())
+            Ok(sequence)
         }
         Err(error) => {
-            flow.cancel_internal_write();
-            Err(error)
+            if error.changed {
+                flow.fail_internal_write_after_change(std::process::id());
+            } else {
+                flow.cancel_internal_write();
+            }
+            Err(error.message)
         }
     }
+}
+
+fn load_replay_record(
+    flow: &FlowEngine,
+    store: &Store,
+    sequence: u32,
+) -> Result<ClipboardRecord, String> {
+    if let Some(record) = flow.record(sequence) {
+        return Ok(record.clone());
+    }
+    store
+        .load_record(sequence)
+        .map_err(|error| format!("读取记录失败：{error}"))?
+        .ok_or_else(|| "记录已不存在".into())
+}
+
+fn prepare_record_paste(
+    flow: &mut FlowEngine,
+    store: &Store,
+    sequence: u32,
+    writer: impl FnOnce(&ClipboardPayload) -> Result<u32, ClipboardWriteError>,
+) -> Result<u32, String> {
+    let record = load_replay_record(flow, store, sequence)?;
+    let written_sequence = write_internal_payload(flow, &record.payload, writer)?;
+    flow.activate_replayed_record(record);
+    discard_inactive_records(flow, Some(sequence));
+    Ok(written_sequence)
 }
 
 fn same_history_group(left: &ClipboardRecord, right: &ClipboardRecord) -> bool {
@@ -102,7 +144,6 @@ fn load_history_page(
     let mut cards = Vec::with_capacity(HISTORY_PAGE_SIZE);
     let mut matched = 0usize;
     let skip = query.page.saturating_mul(HISTORY_PAGE_SIZE);
-    let now = now_ms();
 
     let mut finish_group = |group: &mut Vec<ClipboardRecord>| -> bool {
         if group.is_empty() {
@@ -128,7 +169,6 @@ fn load_history_page(
             if matched >= skip {
                 cards.push(card_view_with_cached_image(
                     card,
-                    now,
                     cached_images.get(&card.representative_sequence),
                 ));
             }
@@ -185,12 +225,62 @@ fn discard_purged_record(store: &Store, flow: &mut FlowEngine) {
     }
 }
 
+/// Owns only the current immutable page; status updates can share it without
+/// rereading payloads or cloning each card's full text.
+#[derive(Default)]
+struct HistoryPage {
+    query: Option<HistoryQuery>,
+    cards: Arc<[CardView]>,
+    has_next: bool,
+    error: Option<String>,
+    invalidated: bool,
+}
+
+impl HistoryPage {
+    fn invalidate(&mut self) {
+        self.invalidated = true;
+    }
+
+    fn refresh(&mut self, store: &Store, query: &HistoryQuery, active: bool) {
+        if !active {
+            *self = Self::default();
+            return;
+        }
+        if !self.invalidated && self.query.as_ref() == Some(query) {
+            return;
+        }
+        let cached_images = self
+            .cards
+            .iter()
+            .filter_map(|card| match &card.payload {
+                CardPayloadView::Image { handle, .. } => Some((card.sequence, handle.clone())),
+                _ => None,
+            })
+            .collect();
+        match load_history_page(store, query, &cached_images) {
+            Ok((cards, has_next)) => {
+                self.cards = cards.into();
+                self.has_next = has_next;
+                self.error = None;
+            }
+            Err(error) => {
+                self.cards = Arc::default();
+                self.has_next = false;
+                self.error = Some(error);
+            }
+        }
+        self.query = Some(query.clone());
+        self.invalidated = false;
+    }
+}
+
 fn publish(
     shared: &SharedUi,
     store: &Store,
     flow: &FlowEngine,
     history_query: &HistoryQuery,
     history_active: bool,
+    history_page: &mut HistoryPage,
     modal_image: &Option<(u32, iced::widget::image::Handle)>,
     tracking: bool,
     tracking_ack: u64,
@@ -202,36 +292,19 @@ fn publish(
     hotkey_active: Hotkey,
     hotkey_error: Option<String>,
 ) {
-    let (cards, history_has_next, status_note) = if history_active {
-        let cached_images = shared
-            .lock()
-            .map(|guard| {
-                guard
-                    .cards
-                    .iter()
-                    .filter_map(|card| match &card.payload {
-                        CardPayloadView::Image { handle, .. } => {
-                            Some((card.sequence, handle.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        match load_history_page(store, history_query, &cached_images) {
-            Ok((cards, has_next)) => (cards, has_next, status_note),
-            Err(error) => (Vec::new(), false, error),
-        }
-    } else {
-        (Vec::new(), false, status_note)
-    };
+    history_page.refresh(store, history_query, history_active);
+    let status_note = history_page.error.clone().unwrap_or(status_note);
     let mut snap = UiState {
         revision: 0,
-        cards,
+        cards: Arc::clone(&history_page.cards),
         history_query: history_query.clone(),
         history_active,
-        history_has_next,
-        modal_image: modal_image.clone(),
+        history_has_next: history_page.has_next,
+        modal_image: if history_active {
+            modal_image.clone()
+        } else {
+            None
+        },
         selected: None,
         record_count: store.count_records().unwrap_or(flow.len()),
         retention,
@@ -307,10 +380,15 @@ fn unexclude_app(
     Ok(exe)
 }
 
-fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender<WindowSignal>) {
+fn run_worker(
+    shared: SharedUi,
+    cmd_rx: Receiver<WorkerCmd>,
+    activate_tx: Sender<WindowSignal>,
+    event_tx: Sender<WorkerEvent>,
+) {
     #[cfg(not(windows))]
     {
-        let _ = (shared, cmd_rx, activate_tx);
+        let _ = (shared, cmd_rx, activate_tx, event_tx);
         return;
     }
 
@@ -326,6 +404,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
         let mut flow = FlowEngine::new();
         let mut history_query = HistoryQuery::default();
         let mut history_active = false;
+        let mut history_page = HistoryPage::default();
         let mut modal_image = None;
         let mut tracking = true;
         let mut tracking_ack = 0;
@@ -356,6 +435,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
             &flow,
             &history_query,
             history_active,
+            &mut history_page,
             &modal_image,
             tracking,
             tracking_ack,
@@ -383,37 +463,40 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                 dirty = true;
                 match cmd {
                     WorkerCmd::Recopy { sequence } => {
-                        let payload = flow
-                            .record(sequence)
-                            .map(|record| record.payload.clone())
-                            .or_else(|| {
-                                store
-                                    .load_record(sequence)
-                                    .ok()
-                                    .flatten()
-                                    .map(|record| record.payload)
-                            });
-                        status_note = match payload {
-                            Some(payload) => {
-                                match write_internal_payload(&mut flow, &payload, write_payload) {
-                                    Ok(()) => "已复制到剪贴板".into(),
-                                    Err(error) => format!("复制失败：{error}"),
-                                }
-                            }
-                            None => "记录已不存在".into(),
+                        status_note = match prepare_record_paste(
+                            &mut flow,
+                            &store,
+                            sequence,
+                            write_payload,
+                        ) {
+                            Ok(_) => "已复制到剪贴板".into(),
+                            Err(error) => format!("复制失败：{error}"),
                         };
+                    }
+                    WorkerCmd::PreparePaste {
+                        sequence,
+                        request_id,
+                    } => {
+                        let result =
+                            prepare_record_paste(&mut flow, &store, sequence, write_payload);
+                        status_note = match &result {
+                            Ok(_) => "已准备粘贴".into(),
+                            Err(error) => format!("粘贴准备失败：{error}"),
+                        };
+                        let _ = event_tx.send(WorkerEvent::PastePrepared { request_id, result });
                     }
                     WorkerCmd::RecopyText { text } => {
                         let payload = ClipboardPayload::Text(text);
                         status_note =
                             match write_internal_payload(&mut flow, &payload, write_payload) {
-                                Ok(()) => "已复制为纯文本".into(),
+                                Ok(_) => "已复制为纯文本".into(),
                                 Err(error) => format!("复制失败：{error}"),
                             };
                     }
                     WorkerCmd::ClearHistory => {
                         status_note = match store.clear() {
                             Ok(()) => {
+                                history_page.invalidate();
                                 flow.clear();
                                 modal_image = None;
                                 history_query.page = 0;
@@ -438,7 +521,9 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                         retention = r;
                         let _ = store.set_setting("retention", r.as_key());
                         if let Some(cutoff) = retention.cutoff_ms(now_ms()) {
-                            let _ = store.purge_older_than(cutoff);
+                            if store.purge_older_than(cutoff).unwrap_or(0) > 0 {
+                                history_page.invalidate();
+                            }
                             discard_purged_record(&store, &mut flow);
                         }
                         status_note = format!("保留期已设为 {}", r.label());
@@ -463,7 +548,10 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                             modal_image = None;
                         }
                         status_note = match store.delete_records(&sequences) {
-                            Ok(_) => {
+                            Ok(removed) => {
+                                if removed > 0 {
+                                    history_page.invalidate();
+                                }
                                 for sequence in sequences {
                                     flow.delete_record(sequence);
                                 }
@@ -474,7 +562,10 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                     }
                     WorkerCmd::SetPinned { sequences, pinned } => {
                         status_note = match store.set_pinned(&sequences, pinned) {
-                            Ok(_) => {
+                            Ok(changed) => {
+                                if changed > 0 {
+                                    history_page.invalidate();
+                                }
                                 flow.set_pinned(&sequences, pinned);
                                 if pinned {
                                     "已固定记录"
@@ -495,10 +586,14 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                     WorkerCmd::SetHistoryActive(active) => {
                         history_active = active;
                         if !active {
+                            history_page = HistoryPage::default();
                             modal_image = None;
                         }
                     }
                     WorkerCmd::LoadFullImage(sequence) => {
+                        if !history_active {
+                            continue;
+                        }
                         modal_image =
                             store
                                 .load_record(sequence)
@@ -531,6 +626,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                 if let Some(cutoff) = retention.cutoff_ms(now) {
                     let removed = store.purge_older_than(cutoff).unwrap_or(0);
                     if removed > 0 {
+                        history_page.invalidate();
                         discard_purged_record(&store, &mut flow);
                         dirty = true;
                     }
@@ -544,6 +640,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                     &flow,
                     &history_query,
                     history_active,
+                    &mut history_page,
                     &modal_image,
                     tracking,
                     tracking_ack,
@@ -560,8 +657,8 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
             let event_received = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(ev) => {
                     match ev {
-                        PlatformEvent::ToggleWindow { visible } => {
-                            let _ = activate_tx.send(WindowSignal::Hotkey { visible });
+                        PlatformEvent::ToggleWindow { visible, target } => {
+                            let _ = activate_tx.send(WindowSignal::Hotkey { visible, target });
                         }
                         PlatformEvent::HotkeyStatus {
                             requested,
@@ -611,10 +708,13 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                                                 if let Err(error) = store.insert_record(rec) {
                                                     flow.delete_record(seq);
                                                     status_note = format!("记录保存失败：{error}");
+                                                } else {
+                                                    history_page.invalidate();
                                                 }
                                             }
                                         }
-                                        discard_inactive_records(&mut flow, Some(seq));
+                                        let active = flow.current_sequence();
+                                        discard_inactive_records(&mut flow, active);
                                     }
                                 }
                                 None => {
@@ -636,6 +736,8 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                                 if let Some(rec) = flow.record(sequence) {
                                     if let Err(error) = store.insert_record(rec) {
                                         status_note = format!("粘贴记录保存失败：{error}");
+                                    } else {
+                                        history_page.invalidate();
                                     }
                                 }
                             }
@@ -655,6 +757,7 @@ fn run_worker(shared: SharedUi, cmd_rx: Receiver<WorkerCmd>, activate_tx: Sender
                     &flow,
                     &history_query,
                     history_active,
+                    &mut history_page,
                     &modal_image,
                     tracking,
                     tracking_ack,
@@ -702,6 +805,169 @@ mod tests {
     }
 
     #[test]
+    fn prepare_paste_restores_typed_payloads_and_suppresses_own_clipboard_update() {
+        let payloads = [
+            ClipboardPayload::Text("original text".into()),
+            ClipboardPayload::Files(vec![r"C:\Pictures\one.png".into(), r"C:\two.txt".into()]),
+            ClipboardPayload::Image {
+                png: vec![137, 80, 78, 71],
+                width: 3,
+                height: 2,
+            },
+        ];
+        for payload in payloads {
+            let mut store = Store::open_in_memory().unwrap();
+            let mut record = text_record(7, "display summary must not be replayed", 10_000);
+            record.payload = payload.clone();
+            record.content_hash = payload_hash(&payload);
+            store.insert_record(&record).unwrap();
+            let mut flow = FlowEngine::new();
+
+            let result = prepare_record_paste(&mut flow, &store, 7, |written| {
+                assert_eq!(written, &payload);
+                Ok(41)
+            });
+            assert_eq!(result, Ok(41));
+            let outcome = flow.on_clipboard_change(ClipboardChange {
+                sequence: 41,
+                payload: payload.clone(),
+                content_hash: payload_hash(&payload),
+                source_pid: std::process::id(),
+                source_exe: "veya.exe".into(),
+                source_window: "Veya".into(),
+                source_confidence: SourceConfidence::Likely,
+                timestamp_ms: 11_000,
+            });
+            assert_eq!(
+                outcome,
+                FlowOutcome::SuppressedInternalWrite { sequence: 41 }
+            );
+            assert_eq!(flow.len(), 1);
+            assert_eq!(flow.current_sequence(), Some(7));
+        }
+    }
+
+    #[test]
+    fn prepare_paste_reads_the_active_flow_record_before_storage() {
+        let store = Store::open_in_memory().unwrap();
+        let mut flow = FlowEngine::new();
+        let payload = ClipboardPayload::Text("active clipboard".into());
+        flow.on_clipboard_change(ClipboardChange {
+            sequence: 7,
+            payload: payload.clone(),
+            content_hash: payload_hash(&payload),
+            source_pid: 200,
+            source_exe: "Code.exe".into(),
+            source_window: "VS Code".into(),
+            source_confidence: SourceConfidence::Exact,
+            timestamp_ms: 10_000,
+        });
+        assert_eq!(
+            prepare_record_paste(&mut flow, &store, 7, |written| {
+                assert_eq!(written, &payload);
+                Ok(41)
+            }),
+            Ok(41)
+        );
+    }
+
+    #[test]
+    fn prepare_paste_missing_record_does_not_touch_clipboard() {
+        let store = Store::open_in_memory().unwrap();
+        let mut flow = FlowEngine::new();
+        assert_eq!(
+            prepare_record_paste(&mut flow, &store, 7, |_| {
+                panic!("missing record must not reach the clipboard writer")
+            }),
+            Err("记录已不存在".into())
+        );
+    }
+
+    #[test]
+    fn prepare_paste_storage_decode_error_does_not_touch_clipboard() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut record = text_record(7, "invalid persisted image", 10_000);
+        record.payload = ClipboardPayload::Image {
+            png: Vec::new(),
+            width: 1,
+            height: 1,
+        };
+        store.insert_record(&record).unwrap();
+        let mut flow = FlowEngine::new();
+        let result = prepare_record_paste(&mut flow, &store, 7, |_| {
+            panic!("unreadable record must not reach the clipboard writer")
+        });
+        assert!(result.unwrap_err().starts_with("读取记录失败："));
+    }
+
+    #[test]
+    fn prepare_paste_write_failure_is_returned_and_does_not_suppress_user_copy() {
+        let mut store = Store::open_in_memory().unwrap();
+        let record = text_record(7, "saved text", 10_000);
+        store.insert_record(&record).unwrap();
+        let mut flow = FlowEngine::new();
+        assert_eq!(
+            prepare_record_paste(
+                &mut flow,
+                &store,
+                7,
+                |_| Err("clipboard unavailable".into())
+            ),
+            Err("clipboard unavailable".into())
+        );
+        let outcome = flow.on_clipboard_change(ClipboardChange {
+            sequence: 50,
+            payload: record.payload,
+            content_hash: record.content_hash,
+            source_pid: 200,
+            source_exe: "Code.exe".into(),
+            source_window: "VS Code".into(),
+            source_confidence: SourceConfidence::Exact,
+            timestamp_ms: 11_000,
+        });
+        assert_eq!(outcome, FlowOutcome::Recorded { sequence: 50 });
+    }
+
+    #[test]
+    fn prepare_paste_unconfirmed_write_preserves_only_own_update_suppression() {
+        let mut store = Store::open_in_memory().unwrap();
+        let record = text_record(7, "saved text", 10_000);
+        store.insert_record(&record).unwrap();
+        let mut flow = FlowEngine::new();
+        let result = prepare_record_paste(&mut flow, &store, 7, |_| {
+            Err(ClipboardWriteError {
+                message: "confirmation busy".into(),
+                changed: true,
+            })
+        });
+        assert_eq!(result, Err("confirmation busy".into()));
+        assert_eq!(flow.current_sequence(), None);
+        let change = ClipboardChange {
+            sequence: 50,
+            payload: record.payload.clone(),
+            content_hash: record.content_hash.clone(),
+            source_pid: std::process::id(),
+            source_exe: "veya.exe".into(),
+            source_window: "Veya".into(),
+            source_confidence: SourceConfidence::Exact,
+            timestamp_ms: 11_000,
+        };
+        assert_eq!(
+            flow.on_clipboard_change(change.clone()),
+            FlowOutcome::SuppressedInternalWrite { sequence: 50 }
+        );
+        assert!(flow.is_empty());
+        let mut user_change = change;
+        user_change.sequence = 51;
+        user_change.source_pid = 12345;
+        user_change.source_exe = "Code.exe".into();
+        assert_eq!(
+            flow.on_clipboard_change(user_change),
+            FlowOutcome::Recorded { sequence: 51 }
+        );
+    }
+
+    #[test]
     fn history_paging_searches_all_records_without_retaining_all_cards() {
         let mut store = Store::open_in_memory().unwrap();
         for sequence in 1..=30 {
@@ -744,6 +1010,109 @@ mod tests {
     }
 
     #[test]
+    fn status_publication_shares_page_and_full_text_without_reading_history() {
+        let mut store = Store::open_in_memory().unwrap();
+        let text = "large clipboard text ".repeat(100_000);
+        store.insert_record(&text_record(1, &text, 10_000)).unwrap();
+        let shared = SharedUi::default();
+        let flow = FlowEngine::new();
+        let query = HistoryQuery::default();
+        let mut page = HistoryPage::default();
+        let mut publish_status =
+            |tracking,
+             tracking_ack,
+             expanded,
+             modal: &Option<(u32, iced::widget::image::Handle)>| {
+                publish(
+                    &shared,
+                    &store,
+                    &flow,
+                    &query,
+                    true,
+                    &mut page,
+                    modal,
+                    tracking,
+                    tracking_ack,
+                    Retention::default(),
+                    Vec::new(),
+                    expanded,
+                    "status changed".into(),
+                    Hotkey::default(),
+                    Hotkey::Disabled,
+                    None,
+                );
+            };
+        publish_status(true, 0, false, &None);
+        let original = shared.lock().unwrap().clone();
+        let ui_clone = original.clone();
+        assert!(Arc::ptr_eq(&original.cards, &ui_clone.cards));
+        assert_eq!(
+            original.cards[0].full_content.as_ptr(),
+            ui_clone.cards[0].full_content.as_ptr()
+        );
+        assert_eq!(ui_clone.cards[0].full_content, text);
+        let modal = Some((
+            1,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        ));
+        publish_status(false, 42, true, &modal);
+        {
+            let current = shared.lock().unwrap();
+            assert!(Arc::ptr_eq(&original.cards, &current.cards));
+            assert!(!current.tracking);
+            assert_eq!(current.tracking_ack, 42);
+            assert!(current.expanded_raw);
+            assert!(current.modal_image.is_some());
+            assert!(current.revision > original.revision);
+        }
+        publish_status(false, 42, false, &None);
+        assert!(Arc::ptr_eq(&original.cards, &shared.lock().unwrap().cards));
+
+        // An unannounced database change stays outside the cached page. This
+        // detects accidental rereads on status-only publications.
+        store
+            .insert_record(&text_record(2, "new record", 20_000))
+            .unwrap();
+        page.refresh(&store, &query, true);
+        assert!(Arc::ptr_eq(&original.cards, &page.cards));
+        page.invalidate();
+        page.refresh(&store, &query, true);
+        assert!(!Arc::ptr_eq(&original.cards, &page.cards));
+        assert_eq!(page.cards[0].sequence, 2);
+    }
+
+    #[test]
+    fn query_replacement_and_inactive_release_do_not_retain_old_pages() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .insert_record(&text_record(1, "first", 10_000))
+            .unwrap();
+        store
+            .insert_record(&text_record(2, "second", 20_000))
+            .unwrap();
+        let mut page = HistoryPage::default();
+        let mut query = HistoryQuery::default();
+        page.refresh(&store, &query, true);
+        let old_page = Arc::downgrade(&page.cards);
+        query.search = "first".into();
+        page.refresh(&store, &query, true);
+        assert!(old_page.upgrade().is_none());
+        assert_eq!(page.cards.len(), 1);
+        assert_eq!(page.cards[0].sequence, 1);
+        let current_page = Arc::downgrade(&page.cards);
+        page.refresh(&store, &query, false);
+        assert!(current_page.upgrade().is_none());
+        assert!(page.cards.is_empty());
+        assert!(page.query.is_none());
+        store
+            .insert_record(&text_record(3, "first new", 30_000))
+            .unwrap();
+        page.refresh(&store, &query, true);
+        assert_eq!(page.cards[0].sequence, 3);
+        assert_eq!(page.query.as_ref(), Some(&query));
+    }
+
+    #[test]
     fn inactive_history_releases_the_published_page() {
         let mut store = Store::open_in_memory().unwrap();
         store
@@ -752,14 +1121,20 @@ mod tests {
         let shared = SharedUi::default();
         let flow = FlowEngine::new();
         let query = HistoryQuery::default();
-        let publish_with_active = |active| {
+        let mut history_page = HistoryPage::default();
+        let modal = Some((
+            1,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        ));
+        let mut publish_with_active = |active| {
             publish(
                 &shared,
                 &store,
                 &flow,
                 &query,
                 active,
-                &None,
+                &mut history_page,
+                &modal,
                 true,
                 0,
                 Retention::default(),
@@ -774,10 +1149,13 @@ mod tests {
 
         publish_with_active(true);
         assert_eq!(shared.lock().unwrap().cards.len(), 1);
+        let old_page = Arc::downgrade(&shared.lock().unwrap().cards);
         publish_with_active(false);
         let snap = shared.lock().unwrap();
         assert!(!snap.history_active);
         assert!(snap.cards.is_empty());
+        assert!(snap.modal_image.is_none());
+        assert!(old_page.upgrade().is_none());
         assert_eq!(snap.record_count, 1);
     }
 

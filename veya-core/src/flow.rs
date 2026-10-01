@@ -27,6 +27,7 @@ pub struct FlowEngine {
     last_seen_seq: Option<u32>,
     pending_internal: Option<InternalClipboardWrite>,
     pending_internal_owner_pid: Option<u32>,
+    pending_internal_failed_after_change: bool,
 }
 
 impl Default for FlowEngine {
@@ -44,6 +45,7 @@ impl FlowEngine {
             last_seen_seq: None,
             pending_internal: None,
             pending_internal_owner_pid: None,
+            pending_internal_failed_after_change: false,
         }
     }
 
@@ -51,6 +53,7 @@ impl FlowEngine {
     pub fn begin_internal_write(&mut self, write: InternalClipboardWrite) {
         self.pending_internal = Some(write);
         self.pending_internal_owner_pid = None;
+        self.pending_internal_failed_after_change = false;
     }
 
     /// After a successful Windows write, bind suppression to the observed
@@ -60,12 +63,48 @@ impl FlowEngine {
         if let Some(pending) = &mut self.pending_internal {
             pending.expected_sequence = Some(sequence);
             self.pending_internal_owner_pid = Some(owner_pid);
+            self.pending_internal_failed_after_change = false;
         }
     }
 
     pub fn cancel_internal_write(&mut self) {
         self.pending_internal = None;
         self.pending_internal_owner_pid = None;
+        self.pending_internal_failed_after_change = false;
+    }
+
+    /// A failed write already changed the clipboard, but its final content and
+    /// sequence were not confirmed. Break the old paste association and suppress
+    /// only the next update if its exact owner is this internal writer. The hash
+    /// can differ after a partial write or image re-encoding; any other next
+    /// update expires this token through the unsequenced-event path.
+    pub fn fail_internal_write_after_change(&mut self, owner_pid: u32) {
+        self.current_seq = None;
+        if let Some(pending) = &mut self.pending_internal {
+            pending.expected_sequence = None;
+            self.pending_internal_owner_pid = Some(owner_pid);
+            self.pending_internal_failed_after_change = true;
+        }
+    }
+
+    /// After a successful replay, associate subsequent observed paste triggers
+    /// with the original raw record, without creating a new copy event.
+    /// An existing in-memory record remains authoritative, including its latest
+    /// pin state and paste activity. Replay does not consume the pending internal
+    /// write token or alter which platform sequence was last observed.
+    pub fn activate_replayed_record(&mut self, record: ClipboardRecord) {
+        let sequence = record.sequence;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.records.entry(sequence) {
+            self.order.push(sequence);
+            entry.insert(record);
+        }
+        self.current_seq = Some(sequence);
+    }
+
+    /// Original raw record associated with the current clipboard payload.
+    /// After replay this can differ from the platform's new clipboard sequence.
+    pub fn current_sequence(&self) -> Option<u32> {
+        self.current_seq
     }
 
     pub fn on_clipboard_change(&mut self, ev: ClipboardChange) -> FlowOutcome {
@@ -77,8 +116,7 @@ impl FlowEngine {
         self.last_seen_seq = Some(ev.sequence);
 
         if self.matches_pending_internal(&ev) {
-            self.pending_internal = None;
-            self.pending_internal_owner_pid = None;
+            self.cancel_internal_write();
             return FlowOutcome::SuppressedInternalWrite {
                 sequence: ev.sequence,
             };
@@ -90,8 +128,7 @@ impl FlowEngine {
         {
             // An unsequenced token means "the next matching event". Once a
             // different event arrives it must not suppress a future user copy.
-            self.pending_internal = None;
-            self.pending_internal_owner_pid = None;
+            self.cancel_internal_write();
         } else {
             self.expire_stale_pending(ev.sequence);
         }
@@ -124,8 +161,7 @@ impl FlowEngine {
     pub fn on_untracked_clipboard_change(&mut self, sequence: u32) {
         self.last_seen_seq = Some(sequence);
         self.current_seq = None;
-        self.pending_internal = None;
-        self.pending_internal_owner_pid = None;
+        self.cancel_internal_write();
     }
 
     pub fn on_paste_trigger(&mut self, ev: PasteTrigger) -> FlowOutcome {
@@ -206,8 +242,7 @@ impl FlowEngine {
         self.order.clear();
         self.current_seq = None;
         self.last_seen_seq = None;
-        self.pending_internal = None;
-        self.pending_internal_owner_pid = None;
+        self.cancel_internal_write();
     }
 
     pub fn search(&self, query: &str) -> Vec<SearchHit<'_>> {
@@ -223,6 +258,10 @@ impl FlowEngine {
         let Some(pending) = &self.pending_internal else {
             return false;
         };
+        if self.pending_internal_failed_after_change {
+            return self.pending_internal_owner_pid == Some(ev.source_pid)
+                && ev.source_confidence == crate::events::SourceConfidence::Exact;
+        }
         if pending.expected_sequence == Some(ev.sequence)
             && self.pending_internal_owner_pid == Some(ev.source_pid)
             && ev.source_confidence == crate::events::SourceConfidence::Exact
@@ -242,8 +281,7 @@ impl FlowEngine {
         if let Some(pending) = &self.pending_internal {
             if let Some(expected) = pending.expected_sequence {
                 if sequence > expected {
-                    self.pending_internal = None;
-                    self.pending_internal_owner_pid = None;
+                    self.cancel_internal_write();
                 }
             }
         }

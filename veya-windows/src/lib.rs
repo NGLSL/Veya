@@ -9,5 +9,8 @@ pub mod platform;
 pub mod tray;
 
 pub use hash::content_hash;
-pub use platform::{enrich_clipboard, enrich_paste, run, write_payload, write_text, PlatformEvent};
+pub use platform::{
+    enrich_clipboard, enrich_paste, run, write_payload, write_text, ClipboardWriteError,
+    PlatformEvent,
+};
 pub use tray::{set_paused as set_tray_paused, TrayEvent};

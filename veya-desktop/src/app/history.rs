@@ -274,7 +274,7 @@ impl App {
                 meta(format!(
                     "{} · {}",
                     short_app(&card.source_app),
-                    card.relative_time
+                    card.relative_time()
                 ))
                 .size(10)
                 .color(theme::MUTED),
@@ -310,7 +310,7 @@ impl App {
         let time_bit = if card.raw_count > 1 && !card.time_range.is_empty() {
             format!("{} 次复制 · {}", card.raw_count, card.time_range)
         } else {
-            format!("{} · {}", short_app(&card.source_app), card.relative_time)
+            format!("{} · {}", short_app(&card.source_app), card.relative_time())
         };
 
         let used_line = if card.has_paste_activity {
@@ -450,7 +450,7 @@ fn card_menu_origin(cursor: iced::Point, window: iced::Size) -> iced::Point {
     iced::Point::new(cursor.x.clamp(0.0, max_x), cursor.y.clamp(0.0, max_y))
 }
 
-fn card_leading_visual<'a>(card: &'a CardView, size: f32) -> Element<'a, Message> {
+pub(super) fn card_leading_visual<'a>(card: &'a CardView, size: f32) -> Element<'a, Message> {
     if let crate::capture::CardPayloadView::Image { handle, .. } = &card.payload {
         let inner = (size - 4.0).max(1.0);
         container(

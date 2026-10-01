@@ -12,6 +12,7 @@ mod hotkey;
 pub mod icon;
 #[cfg(windows)]
 pub mod keyboard;
+pub mod paste;
 #[cfg(windows)]
 pub mod process;
 #[cfg(windows)]
@@ -38,7 +39,7 @@ pub use win::{
 #[cfg(not(windows))]
 mod stub;
 #[cfg(not(windows))]
-pub use stub::{run, write_text, PlatformEvent};
+pub use stub::{run, write_payload, write_text, PlatformEvent};
 #[cfg(not(windows))]
 mod shell_stub;
 #[cfg(not(windows))]
@@ -49,11 +50,53 @@ pub mod shell {
 use veya_core::ClipboardPayload;
 use veya_core::{ClipboardChange, PasteTrigger, SourceConfidence};
 
+/// A replay failure, including whether this attempt already emptied the clipboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardWriteError {
+    pub message: String,
+    pub changed: bool,
+}
+
+impl From<String> for ClipboardWriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            changed: false,
+        }
+    }
+}
+
+impl From<&str> for ClipboardWriteError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::fmt::Display for ClipboardWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClipboardWriteError {}
+
 /// Signal sent to the Iced window owner by a second launch or a global hotkey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowSignal {
     Activate,
-    Hotkey { visible: bool },
+    Hotkey {
+        visible: bool,
+        target: Option<PasteTarget>,
+    },
+}
+
+/// Identity of the external foreground window captured before opening Veya.
+/// Fields are private so callers cannot manufacture an unverified destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteTarget {
+    hwnd: isize,
+    process_id: u32,
+    thread_id: u32,
 }
 
 /// Cheap clipboard signal from the Win32 callback (names resolved later).

@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{ClipboardChangeRaw, PasteTriggerRaw};
+use super::{ClipboardChangeRaw, ClipboardWriteError, PasteTarget, PasteTriggerRaw};
 use crate::hotkey::Hotkey;
 use veya_core::ClipboardPayload;
 
@@ -15,6 +15,7 @@ pub enum PlatformEvent {
     PasteTrigger(PasteTriggerRaw),
     ToggleWindow {
         visible: bool,
+        target: Option<PasteTarget>,
     },
     HotkeyStatus {
         requested: Hotkey,
@@ -31,6 +32,6 @@ pub fn write_text(_text: &str) -> Option<u32> {
     None
 }
 
-pub fn write_payload(_payload: &ClipboardPayload) -> Result<u32, String> {
-    Err("veya-windows clipboard support is Windows-only".to_string())
+pub fn write_payload(_payload: &ClipboardPayload) -> Result<u32, ClipboardWriteError> {
+    Err("veya-windows clipboard support is Windows-only".into())
 }

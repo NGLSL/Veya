@@ -1,6 +1,7 @@
 //! Clipboard capture and replay. Win32 clipboard ownership stays in this module.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use image::ImageFormat;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
@@ -17,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThre
 
 use super::time::now_ms;
 use super::win::{clipboard_owner_hwnd, emit};
-use super::{ClipboardChangeRaw, ClipboardPayloadRaw, PlatformEvent};
+use super::{ClipboardChangeRaw, ClipboardPayloadRaw, ClipboardWriteError, PlatformEvent};
 use veya_core::{ClipboardPayload, SourceConfidence};
 
 /// Sent to the window when clipboard content changes.
@@ -41,6 +42,10 @@ const MAX_FILE_COUNT: u32 = 4096;
 const MAX_PATH_UNITS: usize = 32_767;
 const MAX_FILE_LIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TEXT_UNITS: usize = 1_000_000;
+
+// The listener and replay worker use the same owner HWND. Windows can accept
+// nested opens from those threads, so their Open/Close pairs must not overlap.
+static CLIPBOARD_ACCESS: Mutex<()> = Mutex::new(());
 
 pub fn install_listener(hwnd: HWND) -> windows::core::Result<()> {
     unsafe {
@@ -92,6 +97,16 @@ fn resolve_source() -> (isize, u32, SourceConfidence) {
 }
 
 pub fn handle_clipboard_update(hwnd: HWND) {
+    let _access = match CLIPBOARD_ACCESS.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("无法读取剪贴板：剪贴板访问锁已失效。");
+            emit(PlatformEvent::ClipboardSkipped {
+                sequence: unsafe { GetClipboardSequenceNumber() },
+            });
+            return;
+        }
+    };
     let initial_sequence = unsafe { GetClipboardSequenceNumber() };
     let (mut owner_hwnd, mut source_pid, mut source_confidence) = resolve_source();
     let Some((sequence, payload)) = read_clipboard_payload(hwnd) else {
@@ -121,6 +136,7 @@ pub fn handle_clipboard_update(hwnd: HWND) {
 
 /// Copy exactly one prioritized payload while holding the clipboard lock.
 /// DIB decoding and PNG encoding happen later, on the worker.
+/// The only caller, `handle_clipboard_update`, holds `CLIPBOARD_ACCESS`.
 fn read_clipboard_payload(hwnd: HWND) -> Option<(u32, ClipboardPayloadRaw)> {
     unsafe {
         OpenClipboard(Some(hwnd)).ok()?;
@@ -324,7 +340,7 @@ pub fn dib_to_png(format: u32, bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 
 /// Re-copy a real clipboard payload. Files are always replayed as a copy;
 /// stale paths fail before the current clipboard is emptied.
-pub fn write_payload(payload: &ClipboardPayload) -> Result<u32, String> {
+pub fn write_payload(payload: &ClipboardPayload) -> Result<u32, ClipboardWriteError> {
     match payload {
         ClipboardPayload::Text(text) => {
             let mut bytes = Vec::with_capacity((text.len() + 1) * 2);
@@ -455,10 +471,13 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
     Ok(dib)
 }
 
-fn write_global_payload(format: u32, bytes: &[u8]) -> Result<u32, String> {
+fn write_global_payload(format: u32, bytes: &[u8]) -> Result<u32, ClipboardWriteError> {
     if bytes.is_empty() || bytes.len() > MAX_DIB_BYTES.max(MAX_TEXT_UNITS * 2) {
-        return Err("剪贴板数据超出支持大小".to_string());
+        return Err("剪贴板数据超出支持大小".into());
     }
+    let _access = CLIPBOARD_ACCESS
+        .lock()
+        .map_err(|_| "无法写入剪贴板：剪贴板访问锁已失效。".to_string())?;
     unsafe {
         let owner = clipboard_owner_hwnd().ok_or_else(|| "剪贴板窗口尚未启动".to_string())?;
         let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
@@ -466,28 +485,70 @@ fn write_global_payload(format: u32, bytes: &[u8]) -> Result<u32, String> {
         let pointer = GlobalLock(hglobal);
         if pointer.is_null() {
             let _ = GlobalFree(Some(hglobal));
-            return Err("无法锁定剪贴板内存".to_string());
+            return Err("无法锁定剪贴板内存".into());
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
         let _ = GlobalUnlock(hglobal);
 
         if let Err(error) = OpenClipboard(Some(owner)) {
             let _ = GlobalFree(Some(hglobal));
-            return Err(format!("无法打开剪贴板：{error}"));
+            return Err(format!("无法打开剪贴板：{error}").into());
         }
         if let Err(error) = EmptyClipboard() {
             let _ = CloseClipboard();
             let _ = GlobalFree(Some(hglobal));
-            return Err(format!("无法清空剪贴板：{error}"));
+            return Err(format!("无法清空剪贴板：{error}").into());
         }
-        if let Err(error) = SetClipboardData(format, Some(HANDLE(hglobal.0 as *mut _))) {
-            let _ = GlobalFree(Some(hglobal));
-            let _ = CloseClipboard();
-            return Err(format!("无法写入剪贴板：{error}"));
-        }
-        let _ = CloseClipboard();
-        Ok(GetClipboardSequenceNumber())
+        // From here onward, this attempt has already changed the clipboard,
+        // even if writing or read-only confirmation subsequently fails.
+        let changed_result: Result<u32, String> = (|| {
+            if let Err(error) = SetClipboardData(format, Some(HANDLE(hglobal.0 as *mut _))) {
+                let _ = GlobalFree(Some(hglobal));
+                let _ = CloseClipboard();
+                return Err(format!("无法写入剪贴板：{error}"));
+            }
+            // Closing a write can advance the sequence while Windows adds automatic
+            // formats. Reopen read-only and bind the settled sequence to our owner
+            // and exact original format bytes, rather than acknowledging a new writer.
+            CloseClipboard().map_err(|error| format!("无法确认剪贴板写入完成：{error}"))?;
+            OpenClipboard(Some(owner))
+                .map_err(|error| format!("无法确认剪贴板内容，请重新选择：{error}"))?;
+            let verification = (|| {
+                if GetClipboardOwner().unwrap_or_default() != owner {
+                    return Err("剪贴板已变化，请重新选择。".to_string());
+                }
+                let handle = GetClipboardData(format)
+                    .map_err(|error| format!("无法确认剪贴板内容，请重新选择：{error}"))?;
+                let current = HGLOBAL(handle.0);
+                if GlobalSize(current) < bytes.len() {
+                    return Err("剪贴板已变化，请重新选择。".to_string());
+                }
+                let pointer = GlobalLock(current);
+                if pointer.is_null() {
+                    return Err("无法确认剪贴板内存，请重新选择。".to_string());
+                }
+                // Borrow only the payload range; GlobalAlloc may add trailing padding.
+                // The system owns this handle after SetClipboardData, so never free it.
+                let current_bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), bytes.len());
+                let matches = replay_bytes_match(bytes, current_bytes);
+                let _ = GlobalUnlock(current);
+                if !matches {
+                    return Err("剪贴板已变化，请重新选择。".to_string());
+                }
+                Ok(GetClipboardSequenceNumber())
+            })();
+            CloseClipboard().map_err(|error| format!("无法确认剪贴板读取完成：{error}"))?;
+            verification
+        })();
+        changed_result.map_err(|message| ClipboardWriteError {
+            message,
+            changed: true,
+        })
     }
+}
+
+fn replay_bytes_match(expected: &[u8], current: &[u8]) -> bool {
+    current.get(..expected.len()) == Some(expected)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -523,6 +584,38 @@ fn write_i32(bytes: &mut [u8], offset: usize, value: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_payloads_report_clipboard_unchanged() {
+        let errors = [
+            write_global_payload(CF_UNICODETEXT, &[]).unwrap_err(),
+            write_payload(&ClipboardPayload::Files(Vec::new())).unwrap_err(),
+            write_payload(&ClipboardPayload::Image {
+                png: Vec::new(),
+                width: 1,
+                height: 1,
+            })
+            .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(!error.changed);
+            assert!(!error.message.is_empty());
+            assert_eq!(error.to_string(), error.message);
+        }
+    }
+
+    #[test]
+    fn replay_verification_compares_exact_payload_and_ignores_allocation_padding() {
+        let payload = [0x56, 0, 0x20, 0, 0, 0];
+        assert!(replay_bytes_match(&payload, &payload));
+        assert!(replay_bytes_match(
+            &payload,
+            &[0x56, 0, 0x20, 0, 0, 0, 0x99, 0x88]
+        ));
+        assert!(!replay_bytes_match(&payload, &payload[..5]));
+        assert!(!replay_bytes_match(&payload, &[0x56, 0, 0x21, 0, 0, 0]));
+        assert!(!replay_bytes_match(&payload, &[0x56, 0, 0x20, 0, 0, 1]));
+    }
 
     #[test]
     fn hdrop_encodes_unicode_paths_as_double_nul_terminated_wide_list() {

@@ -85,6 +85,214 @@ fn copy_a_and_copy_b_do_not_cross_link() {
 }
 
 #[test]
+fn replay_associates_paste_attempt_with_original_record_after_internal_event() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(1, "AAA", "ha", "chrome.exe", 1_000));
+    let original = flow.record(1).unwrap().clone();
+    flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: None,
+        hash: "ha".into(),
+    });
+    flow.confirm_internal_write(9, 1234);
+    flow.activate_replayed_record(original.clone());
+    assert_eq!(flow.current_sequence(), Some(1));
+
+    let mut internal = change(9, "AAA", "ha", "veya.exe", 3_000);
+    internal.source_pid = 1234;
+    assert_eq!(
+        flow.on_clipboard_change(internal),
+        FlowOutcome::SuppressedInternalWrite { sequence: 9 }
+    );
+    assert_eq!(flow.current_sequence(), Some(1));
+    assert_eq!(flow.len(), 2);
+    assert!(flow.record(9).is_none());
+    assert_eq!(flow.record(1), Some(&original));
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 4_000)),
+        FlowOutcome::PasteAttached { sequence: 1 }
+    );
+    assert_eq!(flow.record(1).unwrap().pastes.len(), 1);
+    assert_eq!(
+        flow.record(1).unwrap().pastes[0].confidence,
+        veya_core::PasteConfidence::HotkeyObserved
+    );
+    assert!(flow.record(2).unwrap().pastes.is_empty());
+}
+
+#[test]
+fn replay_restores_missing_persisted_record_and_keeps_current_observed_sequence() {
+    let mut history = FlowEngine::new();
+    history.on_clipboard_change(change(1, "AAA", "ha", "chrome.exe", 1_000));
+    history.set_pinned(&[1], true);
+    history.on_paste_trigger(paste("notepad.exe", 1_500));
+    let original = history.record(1).unwrap().clone();
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+    flow.activate_replayed_record(original.clone());
+    assert_eq!(flow.record(1), Some(&original));
+    assert_eq!(
+        flow.records()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    // Activation must not change duplicate detection for the last OS event.
+    assert_eq!(
+        flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_100)),
+        FlowOutcome::DuplicateSequenceIgnored { sequence: 2 }
+    );
+    assert_eq!(
+        flow.on_paste_trigger(paste("editor.exe", 3_000)),
+        FlowOutcome::PasteAttached { sequence: 1 }
+    );
+    assert_eq!(flow.record(1).unwrap().pastes.len(), 2);
+    assert!(flow.record(1).unwrap().pinned);
+    assert_eq!(flow.len(), 2);
+}
+
+#[test]
+fn replay_preserves_newer_in_memory_record_over_stale_snapshot() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(1, "AAA", "ha", "chrome.exe", 1_000));
+    let stale = flow.record(1).unwrap().clone();
+    flow.set_pinned(&[1], true);
+    flow.on_paste_trigger(paste("notepad.exe", 1_500));
+    let latest = flow.record(1).unwrap().clone();
+    flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+    flow.activate_replayed_record(stale);
+    assert_eq!(flow.record(1), Some(&latest));
+    assert_eq!(flow.records().count(), 2);
+}
+
+#[test]
+fn cancelled_write_without_replay_activation_preserves_current_record() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(1, "AAA", "ha", "chrome.exe", 1_000));
+    flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: None,
+        hash: "ha".into(),
+    });
+    flow.cancel_internal_write();
+    assert_eq!(flow.current_sequence(), Some(2));
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 3_000)),
+        FlowOutcome::PasteAttached { sequence: 2 }
+    );
+    assert!(flow.record(1).unwrap().pastes.is_empty());
+}
+
+#[test]
+fn failed_changed_write_clears_association_and_suppresses_its_next_exact_owner_event() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: None,
+        hash: "ha".into(),
+    });
+    flow.fail_internal_write_after_change(1234);
+    assert_eq!(flow.current_sequence(), None);
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 2_500)),
+        FlowOutcome::PasteWithoutRecord
+    );
+    let mut internal = change(9, "AAA", "ha", "veya.exe", 3_000);
+    internal.source_pid = 1234;
+    assert_eq!(
+        flow.on_clipboard_change(internal),
+        FlowOutcome::SuppressedInternalWrite { sequence: 9 }
+    );
+    assert_eq!(flow.current_sequence(), None);
+    assert_eq!(flow.len(), 1);
+    assert!(flow.record(2).unwrap().pastes.is_empty());
+    assert!(flow.record(9).is_none());
+}
+
+#[test]
+fn failed_changed_write_does_not_suppress_external_same_content_or_inferred_owner() {
+    for (pid, confidence) in [
+        (5678, SourceConfidence::Exact),
+        (1234, SourceConfidence::Likely),
+        (1234, SourceConfidence::Unknown),
+    ] {
+        let mut flow = FlowEngine::new();
+        flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+        flow.begin_internal_write(InternalClipboardWrite {
+            expected_sequence: None,
+            hash: "ha".into(),
+        });
+        flow.fail_internal_write_after_change(1234);
+        let mut external = change(9, "AAA", "ha", "other.exe", 3_000);
+        external.source_pid = pid;
+        external.source_confidence = confidence;
+        assert_eq!(
+            flow.on_clipboard_change(external),
+            FlowOutcome::Recorded { sequence: 9 }
+        );
+        assert_eq!(flow.current_sequence(), Some(9));
+        // A mismatched next event consumes the token; it cannot affect a later event.
+        let mut later = change(10, "AAA", "ha", "veya.exe", 4_000);
+        later.source_pid = 1234;
+        assert_eq!(
+            flow.on_clipboard_change(later),
+            FlowOutcome::Recorded { sequence: 10 }
+        );
+    }
+}
+
+#[test]
+fn failed_changed_image_write_suppresses_reencoded_update_only_once() {
+    let mut flow = FlowEngine::new();
+    flow.begin_internal_write(InternalClipboardWrite {
+        expected_sequence: Some(8),
+        hash: "png-before-replay".into(),
+    });
+    flow.fail_internal_write_after_change(1234);
+    let mut rewritten = change(9, "", "png-after-replay", "veya.exe", 5_000);
+    rewritten.source_pid = 1234;
+    rewritten.payload = ClipboardPayload::Image {
+        png: vec![1, 2, 3],
+        width: 1,
+        height: 1,
+    };
+    assert_eq!(
+        flow.on_clipboard_change(rewritten.clone()),
+        FlowOutcome::SuppressedInternalWrite { sequence: 9 }
+    );
+    assert!(flow.is_empty());
+    rewritten.sequence = 10;
+    assert_eq!(
+        flow.on_clipboard_change(rewritten),
+        FlowOutcome::Recorded { sequence: 10 }
+    );
+    assert_eq!(flow.len(), 1);
+}
+
+#[test]
+fn external_and_untracked_changes_replace_replay_association() {
+    let mut flow = FlowEngine::new();
+    flow.on_clipboard_change(change(1, "AAA", "ha", "chrome.exe", 1_000));
+    let original = flow.record(1).unwrap().clone();
+    flow.on_clipboard_change(change(2, "BBB", "hb", "code.exe", 2_000));
+    flow.activate_replayed_record(original.clone());
+    flow.on_clipboard_change(change(3, "CCC", "hc", "browser.exe", 3_000));
+    assert_eq!(flow.current_sequence(), Some(3));
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 4_000)),
+        FlowOutcome::PasteAttached { sequence: 3 }
+    );
+    flow.activate_replayed_record(original);
+    flow.on_untracked_clipboard_change(4);
+    assert_eq!(flow.current_sequence(), None);
+    assert_eq!(
+        flow.on_paste_trigger(paste("notepad.exe", 5_000)),
+        FlowOutcome::PasteWithoutRecord
+    );
+    assert!(flow.record(1).unwrap().pastes.is_empty());
+}
+
+#[test]
 fn untracked_clipboard_change_breaks_previous_paste_association() {
     let mut flow = FlowEngine::new();
     flow.on_clipboard_change(change(1, "previous", "h1", "chrome.exe", 1_000));

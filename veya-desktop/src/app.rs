@@ -20,12 +20,13 @@ use crate::format::{self, ContentKind};
 use crate::icons::{self, Icon};
 use crate::theme::{self, body, meta, pad, section_label};
 use crate::tray::{self, TrayCmd};
-use crate::worker::{spawn_worker, WorkerCmd, WorkerHandle};
+use crate::worker::{spawn_worker, WorkerCmd, WorkerEvent, WorkerHandle};
 use veya_windows::hotkey::{Hotkey, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
-use veya_windows::platform::WindowSignal;
+use veya_windows::platform::{PasteTarget, WindowSignal};
 
 mod detail;
 mod history;
+mod quick;
 mod settings;
 mod tracking;
 mod update;
@@ -55,12 +56,12 @@ fn show_initial_window(physical_position: Option<(f32, f32)>) -> Task<Message> {
 
 /// Keep the Iced window alive when closed to tray, and restore it for every
 /// activation source (tray, second launch, and the global shortcut).
-fn activate_window() -> Task<Message> {
-    iced::window::get_latest().then(|id| {
+fn activate_window(generation: u64) -> Task<Message> {
+    iced::window::get_latest().then(move |id| {
         let Some(id) = id else { return Task::none() };
         iced::window::change_mode(id, iced::window::Mode::Windowed)
             .chain(iced::window::minimize(id, false))
-            .chain(Task::done(Message::WindowRestored(id)))
+            .chain(Task::done(Message::WindowRestored { id, generation }))
     })
 }
 
@@ -81,6 +82,7 @@ fn minimize_window() -> Task<Message> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowAction {
     Show,
+    Quick(Option<PasteTarget>),
     Hide,
     Minimize,
 }
@@ -89,6 +91,7 @@ enum WindowAction {
 fn resolve_window_signals(
     initially_hidden: bool,
     tray_available: bool,
+    mut quick_open: bool,
     signals: impl IntoIterator<Item = WindowSignal>,
 ) -> Option<WindowAction> {
     let mut hidden = initially_hidden;
@@ -96,11 +99,14 @@ fn resolve_window_signals(
     for signal in signals {
         let next = match signal {
             WindowSignal::Activate => WindowAction::Show,
-            WindowSignal::Hotkey { visible } if hidden || !visible => WindowAction::Show,
+            WindowSignal::Hotkey { visible, target } if !quick_open || hidden || !visible => {
+                WindowAction::Quick(target)
+            }
             WindowSignal::Hotkey { .. } if tray_available => WindowAction::Hide,
             WindowSignal::Hotkey { .. } => WindowAction::Minimize,
         };
-        hidden = next != WindowAction::Show;
+        hidden = matches!(next, WindowAction::Hide | WindowAction::Minimize);
+        quick_open = matches!(next, WindowAction::Quick(_));
         action = Some(next);
     }
     action
@@ -111,38 +117,44 @@ mod window_signal_tests {
     use super::{resolve_window_signals, WindowAction, WindowSignal};
 
     #[test]
-    fn hotkey_hides_visible_window_and_restores_hidden_or_minimized_window() {
-        let hotkey = |visible| WindowSignal::Hotkey { visible };
+    fn hotkey_opens_picker_from_manager_and_toggles_the_visible_picker() {
+        let hotkey = |visible| WindowSignal::Hotkey {
+            visible,
+            target: None,
+        };
         assert_eq!(
-            resolve_window_signals(false, true, [hotkey(true)]),
+            resolve_window_signals(false, true, true, [hotkey(true)]),
             Some(WindowAction::Hide)
         );
         assert_eq!(
-            resolve_window_signals(false, true, [hotkey(false)]),
-            Some(WindowAction::Show)
+            resolve_window_signals(false, true, false, [hotkey(true)]),
+            Some(WindowAction::Quick(None))
         );
         assert_eq!(
-            resolve_window_signals(true, true, [hotkey(false)]),
-            Some(WindowAction::Show)
+            resolve_window_signals(true, true, false, [hotkey(false)]),
+            Some(WindowAction::Quick(None))
         );
         assert_eq!(
-            resolve_window_signals(false, false, [hotkey(true)]),
+            resolve_window_signals(false, false, true, [hotkey(true)]),
             Some(WindowAction::Minimize)
         );
     }
 
     #[test]
     fn repeated_hotkey_and_second_launch_resolve_in_order() {
-        let visible = WindowSignal::Hotkey { visible: true };
+        let visible = WindowSignal::Hotkey {
+            visible: true,
+            target: None,
+        };
         assert_eq!(
-            resolve_window_signals(false, true, [visible, visible]),
-            Some(WindowAction::Show)
+            resolve_window_signals(false, true, true, [visible, visible]),
+            Some(WindowAction::Quick(None))
         );
         assert_eq!(
-            resolve_window_signals(false, true, [visible, WindowSignal::Activate]),
+            resolve_window_signals(false, true, true, [visible, WindowSignal::Activate]),
             Some(WindowAction::Show)
         );
-        assert_eq!(resolve_window_signals(false, true, []), None);
+        assert_eq!(resolve_window_signals(false, true, false, []), None);
     }
 }
 
@@ -229,6 +241,10 @@ struct CardMenu {
 }
 
 pub struct App {
+    quick: Option<quick::QuickPanel>,
+    next_paste_request: u64,
+    window_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    last_paste_error: Option<String>,
     shared: SharedUi,
     worker: WorkerHandle,
     tray_rx: Option<std::sync::mpsc::Receiver<TrayCmd>>,
@@ -264,6 +280,35 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    QuickMove(i32),
+    QuickPaste(u32),
+    QuickDismiss {
+        restore: bool,
+    },
+    QuickFinished {
+        request_id: u64,
+        result: Result<(), String>,
+    },
+    TargetRestored {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    QuickPositioned {
+        generation: u64,
+        id: iced::window::Id,
+        size: iced::Size,
+        position: Option<iced::Point>,
+    },
+    QuickShown {
+        generation: u64,
+        id: iced::window::Id,
+    },
+    QuickHidden {
+        generation: u64,
+        target: Option<PasteTarget>,
+        restore: bool,
+    },
+    OpenManager,
     Tick,
     CursorMoved(iced::Point),
     SearchChanged(String),
@@ -286,7 +331,10 @@ pub enum Message {
     GoPage(Page),
     ToggleRaw,
     ToggleDetailMenu,
-    SetPinned { sequences: Vec<u32>, pinned: bool },
+    SetPinned {
+        sequences: Vec<u32>,
+        pinned: bool,
+    },
     OpenContentModal(u32),
     CloseContentModal,
     OpenSource(String),
@@ -304,7 +352,10 @@ pub enum Message {
     WindowMinimize,
     WindowToggleMaximize,
     WindowResized(iced::Size),
-    WindowRestored(iced::window::Id),
+    WindowRestored {
+        id: iced::window::Id,
+        generation: u64,
+    },
     WindowClose,
     SetHotkey(Hotkey),
     StartHotkeyRecord,
@@ -337,6 +388,10 @@ impl App {
         let state = shared.lock().map(|g| g.clone()).unwrap_or_default();
         (
             Self {
+                quick: None,
+                next_paste_request: 0,
+                window_generation: Default::default(),
+                last_paste_error: None,
                 state,
                 shared,
                 worker,
@@ -399,7 +454,7 @@ impl App {
         self.history_active = active;
         if !active {
             self.unload_full_image();
-            self.state.cards.clear();
+            self.state.cards = Default::default();
             self.state.selected = None;
             self.state.history_active = false;
             self.state.history_has_next = false;
@@ -413,8 +468,11 @@ impl App {
         }
         let query = self.history_query();
         let _ = self.worker.cmd_tx.send(WorkerCmd::QueryHistory(query));
+        if self.quick.is_some() {
+            self.state.selected = None;
+        }
         self.ensure_visible_selection();
-        scrollable::snap_to(history_scroll_id(), scrollable::RelativeOffset::START)
+        scrollable::snap_to(self.active_scroll_id(), scrollable::RelativeOffset::START)
     }
 
     fn unload_full_image(&mut self) {
@@ -442,6 +500,8 @@ impl App {
             .map(|_| Message::Tick);
         let keys = if self.hotkey_recording {
             iced::event::listen_with(record_hotkey_event)
+        } else if self.quick.is_some() {
+            iced::event::listen_with(quick::quick_event)
         } else {
             iced::keyboard::on_key_press(handle_key)
         };
@@ -460,6 +520,33 @@ impl App {
             self.card_menu = None;
         }
         match message {
+            Message::QuickMove(delta) => self.quick_move(delta),
+            Message::QuickPaste(sequence) => self.quick_paste(sequence),
+            Message::QuickDismiss { restore } => self.dismiss_quick(restore),
+            Message::QuickFinished { request_id, result } => {
+                self.finish_quick_paste(request_id, result)
+            }
+            Message::TargetRestored { generation, result } => {
+                if self.generation_is_current(generation) {
+                    if let Err(error) = result {
+                        self.state.status_note = error;
+                    }
+                }
+                Task::none()
+            }
+            Message::QuickPositioned {
+                generation,
+                id,
+                size,
+                position,
+            } => self.position_quick(generation, id, size, position),
+            Message::QuickShown { generation, id } => self.focus_quick(generation, id),
+            Message::QuickHidden {
+                generation,
+                target,
+                restore,
+            } => self.quick_hidden(generation, target, restore),
+            Message::OpenManager => self.open_manager(),
             Message::CursorMoved(position) => {
                 self.cursor_position = position;
                 Task::none()
@@ -467,6 +554,13 @@ impl App {
             Message::Tick => {
                 self.updates.poll();
                 let mut tasks = Vec::new();
+                while let Ok(event) = self.worker.event_rx.try_recv() {
+                    match event {
+                        WorkerEvent::PastePrepared { request_id, result } => {
+                            tasks.push(self.quick_prepared(request_id, result));
+                        }
+                    }
+                }
                 if self.chrome_sync_pending {
                     self.sync_chrome_now();
                     self.chrome_sync_attempts = self.chrome_sync_attempts.saturating_add(1);
@@ -516,6 +610,7 @@ impl App {
                 if let Some(action) = resolve_window_signals(
                     self.window_hidden,
                     self.tray_rx.is_some(),
+                    self.quick.is_some(),
                     window_signals,
                 ) {
                     tasks.push(self.apply_window_action(action));
@@ -525,7 +620,7 @@ impl App {
                 });
                 if let Some(mut next) = snapshot {
                     if !self.history_active {
-                        next.cards.clear();
+                        next.cards = Default::default();
                         next.modal_image = None;
                         next.history_active = false;
                         next.history_has_next = false;
@@ -558,6 +653,9 @@ impl App {
                 Task::batch(tasks)
             }
             Message::SearchChanged(q) => {
+                if self.quick.as_ref().is_some_and(|quick| quick.busy()) {
+                    return Task::none();
+                }
                 self.search = q;
                 self.unload_full_image();
                 self.request_history_query(true)
@@ -578,6 +676,13 @@ impl App {
             }
             Message::CloseCardMenu => Task::none(),
             Message::RecopySelected | Message::Copy(_) => {
+                if self.quick.is_some() {
+                    return self
+                        .state
+                        .selected
+                        .map(|seq| self.quick_paste(seq))
+                        .unwrap_or_else(Task::none);
+                }
                 let seq = match message {
                     Message::Copy(s) => Some(s),
                     _ => self.state.selected,
@@ -788,16 +893,31 @@ impl App {
                 self.chrome_sync_attempts = 0;
                 Task::none()
             }
-            Message::WindowRestored(id) => {
+            Message::WindowRestored { id, generation } => {
+                if !self.generation_is_current(generation) || self.window_hidden {
+                    return if self.window_hidden {
+                        hide_window()
+                    } else {
+                        Task::none()
+                    };
+                }
                 self.window_id = Some(id);
                 self.set_history_active(self.page == Page::History);
                 #[cfg(windows)]
                 veya_windows::platform::singleton::ensure_main_window_visible();
                 self.chrome_sync_pending = true;
                 self.chrome_sync_attempts = 0;
-                iced::window::gain_focus(id)
+                let focus = iced::window::gain_focus(id);
+                if self.quick.is_some() {
+                    focus.chain(text_input::focus(search_input_id()))
+                } else {
+                    focus
+                }
             }
             Message::WindowClose => {
+                if self.quick.is_some() {
+                    return self.dismiss_quick(true);
+                }
                 self.cancel_hotkey_recording();
                 self.set_history_active(false);
                 if self.tray_rx.is_some() {
@@ -891,6 +1011,9 @@ impl App {
                 text_input::focus(search_input_id())
             }
             Message::ClearSearch => {
+                if self.quick.is_some() {
+                    return self.dismiss_quick(true);
+                }
                 if self.clear_history_confirmation_open {
                     self.clear_history_confirmation_open = false;
                     return Task::none();
@@ -927,13 +1050,24 @@ impl App {
     }
 
     fn apply_window_action(&mut self, action: WindowAction) -> Task<Message> {
+        if self.quick.as_ref().is_some_and(|quick| quick.sending) {
+            return Task::none();
+        }
         match action {
             WindowAction::Show => {
+                if self.quick.is_some() {
+                    return self.open_manager();
+                }
                 self.window_hidden = false;
                 self.set_history_active(self.page == Page::History);
-                activate_window()
+                let generation = self.advance_window_generation();
+                activate_window(generation)
             }
+            WindowAction::Quick(target) => self.show_quick(target),
             WindowAction::Hide => {
+                if self.quick.is_some() {
+                    return self.dismiss_quick(true);
+                }
                 self.cancel_hotkey_recording();
                 self.window_hidden = true;
                 self.set_history_active(false);
@@ -998,6 +1132,9 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        if self.quick.is_some() {
+            return self.quick_view();
+        }
         let base: Element<'_, Message> = mouse_area(
             container(
                 row![
@@ -1502,7 +1639,7 @@ fn detail_subtitle(card: &CardView) -> String {
             return format!(
                 "{} 项 · {} · {}",
                 paths.len(),
-                card.relative_time,
+                card.relative_time(),
                 card.time_full
             );
         }
@@ -1518,11 +1655,13 @@ fn detail_subtitle(card: &CardView) -> String {
             let host_clean = host.split('/').next().unwrap_or(host);
             return format!(
                 "{} · {} · {}",
-                host_clean, card.relative_time, card.time_full
+                host_clean,
+                card.relative_time(),
+                card.time_full
             );
         }
     }
-    format!("{} · {}", card.relative_time, card.time_full)
+    format!("{} · {}", card.relative_time(), card.time_full)
 }
 
 /// Truncate file path smoothly (e.g. C:\Program Files\...\chrome.exe) without breaking words

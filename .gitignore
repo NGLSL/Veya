@@ -13,6 +13,16 @@
 .idea/
 .vscode/
 *.swp
+.claude/
+
+# Isolated Windows validation outputs (keep scripts and report)
+.scratch/veya-quick-paste/validation/appdata*/
+.scratch/veya-quick-paste/validation/chrome-profile/
+.scratch/veya-quick-paste/validation/vscode-profile/
+.scratch/veya-quick-paste/validation/__pycache__/
+.scratch/veya-quick-paste/validation/*.json
+.scratch/veya-quick-paste/validation/*.png
+.scratch/veya-quick-paste/validation/*.exe
 
 # OS
 Thumbs.db

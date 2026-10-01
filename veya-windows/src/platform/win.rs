@@ -20,7 +20,7 @@ use super::hotkey;
 use super::keyboard;
 use super::singleton;
 use super::window;
-use super::{ClipboardChangeRaw, PasteTriggerRaw};
+use super::{ClipboardChangeRaw, PasteTarget, PasteTriggerRaw};
 use crate::hotkey::Hotkey;
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,7 @@ pub enum PlatformEvent {
     PasteTrigger(PasteTriggerRaw),
     ToggleWindow {
         visible: bool,
+        target: Option<PasteTarget>,
     },
     HotkeyStatus {
         requested: Hotkey,
@@ -203,6 +204,7 @@ pub(crate) unsafe extern "system" fn message_wnd_proc(
             if hotkey::is_active(wparam.0) {
                 emit(PlatformEvent::ToggleWindow {
                     visible: singleton::main_window_is_showing(),
+                    target: super::paste::capture_target(),
                 });
             }
             LRESULT(0)

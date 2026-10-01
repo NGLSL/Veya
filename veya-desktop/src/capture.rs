@@ -87,12 +87,18 @@ pub struct CardView {
     pub source_confidence: SourceConfidence,
     pub source_window: String,
     pub time_full: String,
-    pub relative_time: String,
+    pub created_at_ms: i64,
     pub time_range: String,
     pub used_in: Vec<UsedInView>,
     pub used_in_apps: Vec<String>,
     pub has_paste_activity: bool,
     pub paste_detail: &'static str,
+}
+
+impl CardView {
+    pub fn relative_time(&self) -> String {
+        format::relative_time(self.created_at_ms, format::now_ms())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -146,7 +152,7 @@ impl Retention {
 pub struct UiState {
     /// Advances only when the worker publishes a changed snapshot.
     pub revision: u64,
-    pub cards: Vec<CardView>,
+    pub cards: Arc<[CardView]>,
     pub history_query: HistoryQuery,
     pub history_active: bool,
     pub history_has_next: bool,
@@ -169,7 +175,6 @@ pub type SharedUi = Arc<Mutex<UiState>>;
 
 pub fn card_view_with_cached_image(
     c: &HistoryCard<'_>,
-    now_ms: i64,
     cached_image: Option<&iced::widget::image::Handle>,
 ) -> CardView {
     let used_in: Vec<UsedInView> = c
@@ -214,7 +219,7 @@ pub fn card_view_with_cached_image(
         source_confidence: c.source_confidence,
         source_window: c.source_window.to_string(),
         time_full: crate::format::full_time_label(c.first_created_at_ms),
-        relative_time: crate::format::relative_time(c.first_created_at_ms, now_ms),
+        created_at_ms: c.first_created_at_ms,
         time_range: crate::format::time_range_label(c.first_created_at_ms, c.last_created_at_ms),
         used_in,
         used_in_apps,
