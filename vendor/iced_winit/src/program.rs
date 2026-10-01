@@ -467,8 +467,8 @@ where
                 let poll = self.instance.as_mut().poll(&mut self.context);
 
                 match poll {
-                    task::Poll::Pending => match self.receiver.try_next() {
-                        Ok(Some(control)) => match control {
+                    task::Poll::Pending => match self.receiver.try_recv() {
+                        Ok(control) => match control {
                             Control::ChangeFlow(flow) => {
                                 use winit::event_loop::ControlFlow;
 
@@ -679,10 +679,10 @@ async fn run_instance<P, C>(
 
     loop {
         // Empty the queue if possible
-        let event = if let Ok(event) = event_receiver.try_next() {
-            event
-        } else {
-            event_receiver.next().await
+        let event = match event_receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::TryRecvError::Empty) => event_receiver.next().await,
+            Err(mpsc::TryRecvError::Closed) => None,
         };
 
         let Some(event) = event else {
