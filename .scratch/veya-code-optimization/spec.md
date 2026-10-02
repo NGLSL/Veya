@@ -18,7 +18,7 @@
 | --- | --- | --- | --- | --- |
 | [01](issues/01-state-and-memory.md) | P1 | 状态发布重建历史页；私有当前页缓存、失效控制、隐藏释放 | 无 | 已实现，自动检查和隔离 Windows 对照通过 |
 | [02](issues/02-history-projection.md) | P1 | metadata 投影、首屏先发布、全文／图片按需加载、持久化缩略图 | 01 | 本轮实现并验证；跨页查询游标复用保留后续 |
-| [03](issues/03-incremental-paste-storage.md) | P1 | 单次粘贴重写 payload 和全部 paste；窄增量接口 | 无 | 规划，未实施 |
+| [03](issues/03-incremental-paste-storage.md) | P1 | 单次粘贴重写 payload 和全部 paste；窄增量接口 | 无 | 已实现，自动回归、分配对照与隔离 Windows 运行通过 |
 | [04](issues/04-platform-lifecycle.md) | P1 | Win32 注册中途失败跳过清理；私有 RAII 与可见错误 | 无 | 规划，未实施 |
 | [05](issues/05-streaming-aggregation.md) | P2 | desktop 重复 core 分组规则，长组保留全部载荷；core 有序聚合 | 02 | 已实现，等价／跨批次测试通过 |
 | [06](issues/06-snapshot-sharing.md) | P2 | UI 快照全量复制卡片；共享 immutable 当前页 | 01 | 已实现，与 01 一同验证 |
@@ -40,4 +40,6 @@
 
 01／06 第一轮的相关 worker 自动测试及隔离 Windows 对照已通过：相同 100 条文本／图片夹具、开发构建和 wgpu，管理首页 Private Bytes 从 304,132,096 降至 263,946,240 bytes，Working Set 从 269,373,440 降至 212,615,168 bytes。该结果是单次场景测量，不能推为所有环境的稳定降幅。第一轮证据见 [快捷面板运行报告](../veya-quick-paste/validation/report.md)。
 
-本轮落入 02 的首页／按需加载范围及 05：workspace 115 项测试通过；单机对照冷启动到实际选中记录约 1882 → 1268ms，隐藏后再次 Alt+V 的两次样本约 618／540 → 238／232ms。管理首页 Private Bytes 约 249.0 → 240.3 MiB（首次生成小图），已有小图缓存为 225.1 MiB。首次生成后隐藏的私有内存约比基线高 2.5 MiB，不能宣称全部后台场景下降。矩阵、构建哈希、限制与最终窗口验收见 [本轮运行报告](validation/report.md)。02 的跨页游标复用、03、04 仍未实施。
+首页／按需加载轮次落入 02 及 05：workspace 115 项测试通过；单机对照冷启动到实际选中记录约 1882 → 1268ms，隐藏后再次 Alt+V 的两次样本约 618／540 → 238／232ms。管理首页 Private Bytes 约 249.0 → 240.3 MiB（首次生成小图），已有小图缓存为 225.1 MiB。首次生成后隐藏的私有内存约比基线高 2.5 MiB，不能宣称全部后台场景下降。验证范围与限制见 [v0.2.2 发布说明](../../docs/releases/v0.2.2.md)。
+
+2026-10-02：完成 03 和大图转换副本优化；workspace 121 项测试通过，隔离 Windows 图片捕获／重放与使用线索追加检查通过。4096×2160 转换子进程峰值提交量减少约 34 MiB，4096² 场景约 64 MiB；不推断整个应用的常驻内存下降。随后 CPU 渲染迁移和补丁完成，workspace 共 123 项测试通过。测量、范围和限制见 [v0.2.3 发布说明](../../docs/releases/v0.2.3.md)。02 的跨页游标复用与 04 仍未实施。

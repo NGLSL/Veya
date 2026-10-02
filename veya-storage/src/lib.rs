@@ -220,6 +220,31 @@ impl Store {
         tx.commit()
     }
 
+    /// Append one observed paste without rewriting its record or earlier pastes.
+    /// A missing record fails the foreign-key constraint; no association is saved.
+    pub fn append_paste(
+        &mut self,
+        sequence: u32,
+        paste: &PasteTriggerRecord,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO paste_trigger (
+                clipboard_record_id, target_app, target_pid, target_window,
+                method, confidence, triggered_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                i64::from(sequence),
+                paste.target_app,
+                i64::from(paste.target_pid),
+                paste.target_window,
+                paste.method.label(),
+                paste.confidence.as_str(),
+                paste.triggered_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Return the number of raw clipboard records without loading their payloads.
     pub fn count_records(&self) -> rusqlite::Result<usize> {
         let count: i64 =
@@ -849,6 +874,68 @@ mod tests {
                 triggered_at_ms: 2_000 + i64::from(seq),
             }],
         }
+    }
+
+    #[test]
+    fn append_paste_preserves_image_record_and_existing_paste_ids_after_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "veya-paste-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut image = rec(1);
+        image.payload = ClipboardPayload::Image {
+            png: vec![7; 1024 * 1024],
+            width: 1024,
+            height: 1024,
+        };
+        image.content_type = "image".into();
+        image.content = image.payload.display_text();
+        image.pinned = true;
+        image.source_confidence = SourceConfidence::Likely;
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.insert_record(&image).unwrap();
+            let old_id: i64 = store
+                .conn
+                .query_row("SELECT id FROM paste_trigger", [], |r| r.get(0))
+                .unwrap();
+            // Reject every mutation that would silently regress to a full rewrite.
+            store.conn.execute_batch("CREATE TRIGGER no_record_update BEFORE UPDATE ON clipboard_record BEGIN SELECT RAISE(ABORT, 'record rewritten'); END;
+                CREATE TRIGGER no_paste_delete BEFORE DELETE ON paste_trigger BEGIN SELECT RAISE(ABORT, 'paste deleted'); END;").unwrap();
+            for method in [PasteMethod::ShiftInsert, PasteMethod::CtrlV] {
+                let mut paste = image.pastes[0].clone();
+                paste.method = method;
+                paste.target_window = "same timestamp 窗口".into();
+                store.append_paste(image.sequence, &paste).unwrap();
+                image.pastes.push(paste);
+            }
+            let retained_id: i64 = store
+                .conn
+                .query_row("SELECT min(id) FROM paste_trigger", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(retained_id, old_id);
+            assert_eq!(store.load_record(1).unwrap(), Some(image.clone()));
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.load_record(1).unwrap(), Some(image));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn append_paste_failure_leaves_existing_associations_unchanged() {
+        let mut store = Store::open_in_memory().unwrap();
+        let record = rec(1);
+        store.insert_record(&record).unwrap();
+        assert!(store.append_paste(999, &record.pastes[0]).is_err());
+        store.conn.execute_batch("CREATE TRIGGER reject_paste BEFORE INSERT ON paste_trigger BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        assert!(store.append_paste(1, &record.pastes[0]).is_err());
+        assert_eq!(store.load_all().unwrap(), vec![record]);
     }
 
     #[test]

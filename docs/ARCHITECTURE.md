@@ -17,7 +17,7 @@ flowchart LR
 ```
 
 1. `veya-windows/src/platform/` 的 Win32 消息循环发出 `PlatformEvent`。剪贴板信号包含内容及来源线索；低级键盘钩子发出粘贴触发线索；同一消息线程注册全局窗口快捷键，并在 `WM_HOTKEY` 到来时采样主窗口是否可见且未最小化。`enrich_clipboard`、`enrich_paste` 补充进程名、窗口名和时间信息。
-2. `veya-desktop/src/worker.rs` 独占运行中的 `FlowEngine` 和事件写入使用的 `Store`：`FlowEngine` 只保留当前粘贴关联所需的活跃记录，完整历史保存在 SQLite。worker 处理平台事件和 `WorkerCmd`，把变化写回 SQLite。私有 `history_loader.rs` 后台线程持有独立的 `Store` 连接，按 `(created_at_ms, sequence)` 游标分批读取轻量历史投影，用 core 有序聚合器逐组筛选，每次只发布一页卡片。搜索、分类、固定筛选和排序仍应用于完整历史。追踪开关的 UI 请求带序号；快照回传已处理的序号，避免定时同步把刚点击的状态短暂覆盖为旧值。
+2. `veya-desktop/src/worker.rs` 独占运行中的 `FlowEngine` 和事件写入使用的 `Store`：`FlowEngine` 只保留当前粘贴关联所需的活跃记录，完整历史保存在 SQLite。worker 处理平台事件和 `WorkerCmd`，把变化写回 SQLite。粘贴触发只通过 `Store::append_paste` 追加本次使用线索，不重写载荷和既有线索；数据库写入成功后才更新 core，失败向 UI 报告并保留原内存状态，不自动重试。私有 `history_loader.rs` 后台线程持有独立的 `Store` 连接，按 `(created_at_ms, sequence)` 游标分批读取轻量历史投影，用 core 有序聚合器逐组筛选，每次只发布一页卡片。搜索、分类、固定筛选和排序仍应用于完整历史。追踪开关的 UI 请求带序号；快照回传已处理的序号，避免定时同步把刚点击的状态短暂覆盖为旧值。
 3. `veya-desktop/src/app.rs` 的 Iced `App` 在 `Tick` 中读取快照并集中处理消息；`app/history.rs`、`app/detail.rs` 和 `app/settings.rs` 分别渲染历史、详情/完整内容弹窗和设置。`app/tracking.rs` 保存追踪开关尚未确认的请求，并用 worker 快照序号完成确认。复制、删除、排除应用等动作通过 `WorkerCmd` 发给 worker。
 4. `veya-desktop/src/main.rs` 在单例门禁和键盘钩子启动前，通过 `veya-windows/src/platform/elevation.rs` 检查安装器继承的管理员权限，并尝试用 Explorer 用户令牌重新启动。之后负责单例门禁、字体和 Iced 窗口装配。第二次启动通过 `veya-windows/src/platform/singleton.rs` 通知已有实例。热键默认打开 `app/quick.rs` 的快捷粘贴面板，并在平台消息线程中立即采样外部目标 HWND/PID/TID；再次按热键可收起可见面板。托盘、单例通知和面板的“管理历史”打开完整窗口。热键注册状态由 worker 发布到设置页。
 
@@ -44,8 +44,9 @@ flowchart LR
 - **首屏与延后加载**：后台线程先提交可选择／重放的卡片，worker 发布快照后才允许逐张生成缩略图；图片未就绪时保留类型、尺寸和占位。待处理查询只保留最新请求，结果队列有界，查询／数据变化与退出历史页通过代数取消，旧回执不能覆盖当前页。最长边 128px 的 RGBA 缩略图按当前记录与内容哈希缓存在 SQLite，已有图片只在被显示时生成，没有启动全量回填。管理详情只按需保留一条完整内容，用 `Arc<str>` 分享给 UI；纯文本复制按原序列读取完整内容，不使用摘要。原图弹窗和 typed replay 仍按序列号读取完整原始载荷。
 
 缩略图生成直接使用已有 `png` 解码依赖的逐行接口，常规 8-bit、非交错的大图只保留解码行与小图累加器，缩小后的像素与原 `image::thumbnail` 路径对照一致。小图、16-bit 或交错 PNG 沿用原图片解码路径；取消在逐行／阶段边界检查。缩略图失败有结束状态，原记录仍可选择并触发原图／重放操作。完整原图不受缩略图生成方式影响。
-- **渲染器与字体**：桌面端使用 Iced 默认的 `wgpu` 渲染器；可显式设置 `ICED_BACKEND` 进行诊断。软件渲染器在 Windows 托盘恢复时可能短暂暴露系统标题栏，因此不作为默认选项。中文 UI 字体从 Iced 已扫描的系统字体中选择，沿用字体文件映射，不把字体文件再次读为私有字节。
+- **渲染器与字体**：桌面端参考 Kite，在 Cargo 中关闭 Iced 默认特性并显式选择 `tiny-skia`，由 CPU 绘制界面；当前构建不启用 `wgpu`，无需环境变量选择后端。保留现有图片、SVG、异步运行时及字体／主题特性。Veya 的 Iced 0.13 已在 UI 更新后请求重绘，不需要迁移 Kite 在 Iced 0.14 中使用的 `unconditional-rendering` 特性。窗口恢复仍需验证首帧与无边框显示，不能用编译通过代替验收。中文 UI 字体从 Iced 已扫描的系统字体中选择，沿用字体文件映射，不把字体文件再次读为私有字节。
 - **隐藏窗口的调度**：`vendor/iced_winit` 保留 Iced 0.13.0 的一个 Windows 补丁：重绘等待到期时先退回事件等待，避免隐藏窗口未完成重绘时反复处理过期 `WaitUntil`，占满一个 UI 核心。未来的等待期限仍由原保护逻辑保留，可见窗口照常设置后续动画时间。来源、唯一源码改动及升级移除条件见 `vendor/iced_winit/PATCHES.md`；不修改全局 Cargo 缓存。
+- **软件画面的恢复**：`vendor/iced_tiny_skia` 保留同版本渲染器，仅修复两个边界：零面积布局区域不绘制；画面内容未变时仍将缓存像素提交给系统，保证最小化／遮挡后恢复能补绘。补丁来源及移除条件见 `vendor/iced_tiny_skia/PATCHES.md`。
 
 ## 系统动作
 

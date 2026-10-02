@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use veya_core::{
     payload_hash, ClipboardPayload, ClipboardRecord, FlowEngine, InternalClipboardWrite,
-    PasteConfidence,
+    PasteConfidence, PasteTrigger, PasteTriggerRecord,
 };
 use veya_storage::Store;
 use veya_windows::hotkey::Hotkey;
@@ -143,6 +143,34 @@ fn prepare_record_paste(
 #[cfg(test)]
 fn load_history_page(store: &Store, query: &HistoryQuery) -> Result<(Vec<CardView>, bool), String> {
     history_loader::load_page(store, query, &|| true)?.ok_or_else(|| "cancelled".into())
+}
+
+fn persist_paste_trigger(
+    store: &mut Store,
+    flow: &mut FlowEngine,
+    trigger: PasteTrigger,
+) -> Result<bool, String> {
+    let Some(sequence) = flow
+        .current_sequence()
+        .filter(|seq| flow.record(*seq).is_some())
+    else {
+        return Ok(false);
+    };
+    let paste = PasteTriggerRecord {
+        target_app: trigger.target_exe.clone(),
+        target_pid: trigger.target_pid,
+        target_window: trigger.target_window.clone(),
+        method: trigger.method,
+        confidence: PasteConfidence::HotkeyObserved,
+        triggered_at_ms: trigger.timestamp_ms,
+    };
+    // Keep core and persisted history in agreement if this write fails.
+    store
+        .append_paste(sequence, &paste)
+        .map_err(|error| format!("粘贴记录保存失败：{error}"))?;
+    let outcome = flow.on_paste_trigger(trigger);
+    debug_assert_eq!(outcome, veya_core::FlowOutcome::PasteAttached { sequence });
+    Ok(true)
 }
 
 fn discard_inactive_records(flow: &mut FlowEngine, keep: Option<u32>) {
@@ -815,15 +843,10 @@ fn run_worker(
                         }
                         PlatformEvent::PasteTrigger(raw) if tracking => {
                             let trigger = enrich_paste(raw);
-                            let outcome = flow.on_paste_trigger(trigger);
-                            if let veya_core::FlowOutcome::PasteAttached { sequence } = outcome {
-                                if let Some(rec) = flow.record(sequence) {
-                                    if let Err(error) = store.insert_record(rec) {
-                                        status_note = format!("粘贴记录保存失败：{error}");
-                                    } else {
-                                        history_page.invalidate();
-                                    }
-                                }
+                            match persist_paste_trigger(&mut store, &mut flow, trigger) {
+                                Ok(true) => history_page.invalidate(),
+                                Ok(false) => {}
+                                Err(error) => status_note = error,
                             }
                         }
                         _ => {}
@@ -886,6 +909,94 @@ mod tests {
             pinned: false,
             pastes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn persisted_pastes_match_core_including_repeated_timestamps_and_methods() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut flow = FlowEngine::new();
+        let record = text_record(1, "paste source", 1000);
+        store.insert_record(&record).unwrap();
+        let trigger = PasteTrigger {
+            target_pid: 42,
+            target_exe: "notepad.exe".into(),
+            target_window: "目标窗口".into(),
+            method: PasteMethod::CtrlV,
+            timestamp_ms: 2000,
+        };
+        assert_eq!(
+            persist_paste_trigger(&mut store, &mut flow, trigger.clone()),
+            Ok(false)
+        );
+        flow.activate_replayed_record(record);
+        for method in [
+            PasteMethod::CtrlV,
+            PasteMethod::ShiftInsert,
+            PasteMethod::CtrlV,
+        ] {
+            let mut trigger = trigger.clone();
+            trigger.method = method;
+            assert_eq!(
+                persist_paste_trigger(&mut store, &mut flow, trigger),
+                Ok(true)
+            );
+        }
+        assert_eq!(flow.record(1), store.load_record(1).unwrap().as_ref());
+        assert_eq!(flow.record(1).unwrap().pastes.len(), 3);
+        assert!(flow
+            .record(1)
+            .unwrap()
+            .pastes
+            .iter()
+            .all(|p| p.confidence == PasteConfidence::HotkeyObserved && p.triggered_at_ms == 2000));
+    }
+
+    #[test]
+    fn failed_paste_persistence_does_not_mutate_core_or_saved_history() {
+        let path = std::env::temp_dir().join(format!(
+            "veya-worker-paste-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut store = Store::open(&path).unwrap();
+            let mut flow = FlowEngine::new();
+            let record = text_record(1, "paste source", 1000);
+            flow.activate_replayed_record(record.clone());
+            let trigger = PasteTrigger {
+                target_pid: 42,
+                target_exe: "notepad.exe".into(),
+                target_window: "target".into(),
+                method: PasteMethod::ShiftInsert,
+                timestamp_ms: 2000,
+            };
+            let error = persist_paste_trigger(&mut store, &mut flow, trigger.clone()).unwrap_err();
+            assert!(error.starts_with("粘贴记录保存失败："));
+            assert_eq!(flow.record(1), Some(&record));
+            assert!(store.load_record(1).unwrap().is_none());
+            store.insert_record(&record).unwrap();
+            // Establish an older saved association before injecting a real SQL failure.
+            assert_eq!(
+                persist_paste_trigger(&mut store, &mut flow, trigger.clone()),
+                Ok(true)
+            );
+            let before = store.load_record(1).unwrap().unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TRIGGER reject_paste BEFORE INSERT ON paste_trigger BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+            let error = persist_paste_trigger(&mut store, &mut flow, trigger).unwrap_err();
+            assert!(error.contains("injected write failure"));
+            assert_eq!(flow.record(1), Some(&before));
+            assert_eq!(store.load_record(1).unwrap(), Some(before.clone()));
+            drop(store);
+            assert_eq!(
+                Store::open(&path).unwrap().load_record(1).unwrap(),
+                Some(before)
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

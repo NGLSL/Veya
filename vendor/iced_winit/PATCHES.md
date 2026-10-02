@@ -19,7 +19,7 @@ without changing the previous `Result<Option<T>, _>` behavior.
 
 Veya uses this copy through the root `[patch.crates-io]`. Remove the patch only
 after an upstream runtime upgrade passes the hidden CPU regression and visible
-caret/reopen checks in `.scratch/veya-code-optimization/validation/`.
+caret/reopen checks described in `docs/DEVELOPMENT.md`.
 
 Do not edit the shared Cargo registry cache. All other source files match the
 upstream package.

@@ -1,9 +1,9 @@
 # 03：粘贴线索增量持久化
 
-Status: ready-for-agent
+Status: resolved
 Priority: P1
 Blocked by: none
-Implementation: 规划，未实施
+Implementation: 已实现；自动回归、存储分配对照及隔离 Windows 运行检查通过
 
 ## 根因与负责范围
 
@@ -19,3 +19,5 @@ worker 的 paste 路径调用 `Store::insert_record`；该接口编码并 upsert
 ## Comments
 
 不改变「paste attempt 并非目标插入成功」的业务语义。
+
+2026-10-02：新增 `Store::append_paste` 单条 INSERT，worker 数据库成功后才更新 core；外键缺失和真实 SQL 故障均保留原内存／存储状态并反馈失败。8 MiB 图片与 1,000 条旧线索的十次粘贴对照中，载荷逻辑重写 80 MiB → 0，Rust 新增分配峰值约 8.06 MiB → 62.7 KiB。真实 Windows 四次触发只增加四条线索，原始载荷与旧线索 ID 保留。自动检查共 121 项通过；测量范围和限制见 [v0.2.3 发布说明](../../../docs/releases/v0.2.3.md)。

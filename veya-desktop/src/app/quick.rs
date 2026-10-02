@@ -653,6 +653,64 @@ mod tests {
     }
 
     #[test]
+    fn hidden_quick_dismissal_can_render_before_the_window_resizes() {
+        let (mut app, _) = ready_text_app();
+        let _ = app.show_quick(None);
+        let size = iced::Size::new(QUICK_WIDTH, QUICK_HEIGHT);
+        let _ = app.update(Message::WindowResized(size));
+        let _ = app.dismiss_quick(false);
+        assert!(app.window_hidden);
+        assert!(app.quick.is_none());
+
+        render_at(&app, size);
+    }
+
+    #[test]
+    fn opening_manager_can_render_before_the_window_resizes() {
+        let (mut app, _) = ready_text_app();
+        let _ = app.show_quick(None);
+        let size = iced::Size::new(QUICK_WIDTH, QUICK_HEIGHT);
+        let _ = app.update(Message::WindowResized(size));
+        let _ = app.open_manager();
+        assert!(!app.window_hidden);
+        assert!(app.quick.is_none());
+
+        render_at(&app, size);
+    }
+
+    fn render_at(app: &App, size: iced::Size) {
+        // Iced can draw the updated view before executing hide/resize tasks.
+        // Exercise the actual CPU renderer at the previous quick-panel size.
+        let mut renderer = iced::Renderer::new(crate::font::ui_font(), iced::Pixels(16.0));
+        let mut ui = iced_runtime::UserInterface::build(
+            app.view(),
+            size,
+            iced_runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        ui.draw(
+            &mut renderer,
+            &Theme::Dark,
+            &iced_runtime::core::renderer::Style {
+                text_color: Color::WHITE,
+            },
+            iced::mouse::Cursor::Unavailable,
+        );
+        let physical_size = iced::Size::new(size.width as u32, size.height as u32);
+        let viewport = iced_graphics::Viewport::with_physical_size(physical_size, 1.0);
+        let mut pixels = tiny_skia::Pixmap::new(physical_size.width, physical_size.height).unwrap();
+        let mut mask = tiny_skia::Mask::new(physical_size.width, physical_size.height).unwrap();
+        renderer.draw::<String>(
+            &mut pixels.as_mut(),
+            &mut mask,
+            &viewport,
+            &[iced::Rectangle::with_size(size)],
+            Color::BLACK,
+            &[],
+        );
+    }
+
+    #[test]
     fn plain_copy_requests_original_record_without_using_excerpt() {
         let (mut app, commands) = ready_text_app();
         assert!(!app.state.cards[0].content_excerpt.contains("TAIL"));

@@ -324,8 +324,7 @@ pub fn dib_to_png(format: u32, bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         image::load_from_memory_with_format(&bmp, ImageFormat::Bmp).ok()?
     };
 
-    let rgba = decoded.to_rgba8();
-    if rgba.width() != width || rgba.height() != height {
+    if decoded.width() != width || decoded.height() != height {
         return None;
     }
     let mut png = Vec::new();
@@ -449,6 +448,9 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
         .ok_or_else(|| "图片尺寸超出支持范围".to_string())?;
     let image_size = u32::try_from(pixel_bytes).map_err(|_| "图片数据超出支持大小".to_string())?;
 
+    // Reuse an RGBA decoder buffer, or finish converting other PNG color types
+    // before allocating the destination. A borrowed conversion clones RGBA.
+    let mut bgra = decoded.into_rgba8().into_raw();
     let mut dib = vec![0u8; total];
     write_u32(&mut dib, 0, 124);
     write_i32(&mut dib, 4, width as i32);
@@ -463,7 +465,6 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
     write_u32(&mut dib, 52, 0xff00_0000); // alpha mask
     write_u32(&mut dib, 56, LCS_SRGB);
 
-    let mut bgra = decoded.to_rgba8().into_raw();
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
@@ -669,6 +670,66 @@ mod tests {
                 height,
             })
         );
+    }
+
+    #[test]
+    fn dibv5_replay_preserves_png_color_conversion_and_alpha() {
+        let images = [
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                1,
+                image::Rgb([12, 34, 56]),
+            )),
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(2, 1, image::Luma([123]))),
+            image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_pixel(
+                2,
+                1,
+                image::LumaA([123, 78]),
+            )),
+            image::DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+                2,
+                1,
+                image::Rgba([0x1234u16, 0x5678, 0x9abc, 0xdef0]),
+            )),
+        ];
+        for image in images {
+            let expected = image.to_rgba8();
+            let mut png = Vec::new();
+            image
+                .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+                .unwrap();
+            let dib = encode_dibv5(&png, 2, 1).unwrap();
+            let (round_trip, width, height) = dib_to_png(CF_DIBV5, &dib).unwrap();
+            let actual = image::load_from_memory_with_format(&round_trip, ImageFormat::Png)
+                .unwrap()
+                .into_rgba8();
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn embedded_png_dib_checks_decoded_dimensions() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            1,
+            image::Rgba([12, 34, 56, 78]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+        .unwrap();
+        let mut dib = vec![0; 124];
+        write_u32(&mut dib, 0, 124);
+        write_i32(&mut dib, 4, 2);
+        write_i32(&mut dib, 8, 1);
+        write_u16(&mut dib, 12, 1);
+        write_u16(&mut dib, 14, 32);
+        write_u32(&mut dib, 16, BI_PNG);
+        write_u32(&mut dib, 20, png.len() as u32);
+        dib.extend_from_slice(&png);
+        assert_eq!(dib_to_png(CF_DIBV5, &dib), Some((png, 2, 1)));
+        write_i32(&mut dib, 4, 1);
+        assert!(dib_to_png(CF_DIBV5, &dib).is_none());
     }
 
     #[test]

@@ -13,7 +13,8 @@ path = "src/main.rs"
 veya-core = { workspace = true }
 veya-windows = { workspace = true }
 veya-storage = { workspace = true }
-iced = { version = "0.13", features = ["tokio", "image", "svg"] }
+# Like Kite, select the software renderer at build time; do not include wgpu.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "image", "svg", "fira-sans", "auto-detect-theme"] }
 iced_graphics = "0.13"
 image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.18"
@@ -26,3 +27,8 @@ windows = { workspace = true, features = [
 
 [build-dependencies]
 winres = "0.1"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+iced_runtime = "0.13"
+tiny-skia = "0.11"
