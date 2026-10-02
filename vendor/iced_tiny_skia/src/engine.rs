@@ -599,7 +599,10 @@ impl Engine {
                 let center = physical_bounds.center();
                 let radians = f32::from(svg.rotation);
 
-                let transform = into_transform(_transformation).post_rotate_at(
+                // SVGs are rasterized at physical_bounds, so the pixel buffer
+                // and its position already include DPI scaling. Only rotate
+                // here; scaling again moves and enlarges icons at high DPI.
+                let transform = tiny_skia::Transform::identity().post_rotate_at(
                     radians.to_degrees(),
                     center.x,
                     center.y,

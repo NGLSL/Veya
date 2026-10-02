@@ -425,3 +425,146 @@ where
             ..Default::default()
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use iced_runtime::core::image::{FilterMethod, Image, Renderer as _};
+    use iced_runtime::core::svg::{Renderer as _, Svg};
+    use iced_runtime::core::Renderer as _;
+
+    use super::*;
+
+    fn assert_svg_pixel_bounds(scale_factor: f64) {
+        // Use the same SVG renderer as the UI, with an opaque square so its
+        // physical pixel bounds are unambiguous at every Windows DPI scale.
+        let handle = square_svg();
+        assert_pixel_bounds(scale_factor, icon_bounds(), |renderer| {
+            renderer.draw_svg(Svg::new(handle), icon_bounds());
+        });
+    }
+
+    fn square_svg() -> svg::Handle {
+        svg::Handle::from_memory(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" fill="white"/></svg>"#
+                .to_vec(),
+        )
+    }
+
+    fn icon_bounds() -> iced::Rectangle {
+        iced::Rectangle {
+            x: 48.0,
+            y: 40.0,
+            width: 24.0,
+            height: 24.0,
+        }
+    }
+
+    fn assert_pixel_bounds(
+        scale_factor: f64,
+        bounds: iced::Rectangle,
+        draw: impl FnOnce(&mut iced::Renderer),
+    ) {
+        let mut renderer = iced::Renderer::new(iced::Font::DEFAULT, iced::Pixels(16.0));
+        draw(&mut renderer);
+
+        let physical_size =
+            iced::Size::new((256.0 * scale_factor) as u32, (192.0 * scale_factor) as u32);
+        let viewport = iced_graphics::Viewport::with_physical_size(physical_size, scale_factor);
+        let mut pixels = tiny_skia::Pixmap::new(physical_size.width, physical_size.height).unwrap();
+        let mut mask = tiny_skia::Mask::new(physical_size.width, physical_size.height).unwrap();
+        renderer.draw::<String>(
+            &mut pixels.as_mut(),
+            &mut mask,
+            &viewport,
+            &[iced::Rectangle::with_size(iced::Size::new(256.0, 192.0))],
+            Color::TRANSPARENT,
+            &[],
+        );
+
+        let mut painted_bounds = None;
+        for y in 0..physical_size.height {
+            for x in 0..physical_size.width {
+                if pixels.pixel(x, y).unwrap().alpha() != 0 {
+                    let (left, top, right, bottom) = painted_bounds.get_or_insert((x, y, x, y));
+                    *left = (*left).min(x);
+                    *top = (*top).min(y);
+                    *right = (*right).max(x);
+                    *bottom = (*bottom).max(y);
+                }
+            }
+        }
+        let scale = scale_factor as f32;
+        let expected = (
+            (bounds.x * scale) as u32,
+            (bounds.y * scale) as u32,
+            ((bounds.x + bounds.width) * scale) as u32 - 1,
+            ((bounds.y + bounds.height) * scale) as u32 - 1,
+        );
+        assert_eq!(
+            painted_bounds,
+            Some(expected),
+            "Image position and size must match the physical bounds at scale {scale_factor}"
+        );
+    }
+
+    #[test]
+    fn svg_pixel_bounds_at_100_percent() {
+        assert_svg_pixel_bounds(1.0);
+    }
+
+    #[test]
+    fn svg_pixel_bounds_at_125_percent() {
+        assert_svg_pixel_bounds(1.25);
+    }
+
+    #[test]
+    fn svg_pixel_bounds_at_150_percent() {
+        assert_svg_pixel_bounds(1.5);
+    }
+
+    #[test]
+    fn svg_pixel_bounds_at_200_percent() {
+        assert_svg_pixel_bounds(2.0);
+    }
+
+    #[test]
+    fn raster_pixel_bounds_match_at_each_dpi_scale() {
+        // Native application icons use raster handles. This control checks that
+        // the shared viewport and target pixel buffer apply DPI correctly.
+        let handle = iced::widget::image::Handle::from_rgba(24, 24, vec![255; 24 * 24 * 4]);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            assert_pixel_bounds(scale, icon_bounds(), |renderer| {
+                renderer.draw_image(
+                    Image::new(handle.clone()).filter_method(FilterMethod::Nearest),
+                    icon_bounds(),
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn rotated_svg_keeps_its_physical_center_and_layer_clip() {
+        for scale in [1.25, 2.0] {
+            let handle = square_svg();
+            assert_pixel_bounds(scale, icon_bounds(), |renderer| {
+                renderer.draw_svg(
+                    Svg::new(handle.clone()).rotation(iced::Radians(std::f32::consts::FRAC_PI_2)),
+                    icon_bounds(),
+                );
+            });
+
+            let clip = iced::Rectangle {
+                width: 12.0,
+                ..icon_bounds()
+            };
+            assert_pixel_bounds(scale, clip, |renderer| {
+                renderer.start_layer(clip);
+                renderer.draw_svg(
+                    Svg::new(handle).rotation(iced::Radians(std::f32::consts::FRAC_PI_2)),
+                    icon_bounds(),
+                );
+                renderer.end_layer();
+            });
+        }
+    }
+}
