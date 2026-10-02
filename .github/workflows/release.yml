@@ -40,8 +40,8 @@ jobs:
       - name: Install Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt
-          rustup default stable-x86_64-pc-windows-msvc
+          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt
+          rustup default 1.99.0-x86_64-pc-windows-msvc
       - name: Verify workspace
         shell: pwsh
         run: |

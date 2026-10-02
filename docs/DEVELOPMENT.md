@@ -7,11 +7,11 @@
 Veya 是 Windows-only 的 Rust workspace，当前使用 Rust 2021 和 MSVC 工具链。准备以下环境：
 
 - Windows 10/11 开发机或等价的 Windows CI runner；
-- Rust stable 的 `x86_64-pc-windows-msvc` 工具链；
+- Rust 1.99.0 的 `x86_64-pc-windows-msvc` 工具链；
 - Visual Studio Build Tools 的 MSVC 编译工具和 Windows SDK；
 - PowerShell 和 Cargo。
 
-检查工具链和编译器：
+仓库通过 `rust-toolchain.toml` 固定 Rust 1.99.0，使用 minimal profile 并安装 `rustfmt`；使用 rustup 时会自动选择对应工具链。CI 和 Release 使用同一版本。检查工具链和编译器：
 
 ```powershell
 rustc -Vv
@@ -34,7 +34,7 @@ cargo build -p veya-desktop
 
 `cargo test --workspace` 是默认行为门禁，覆盖 core 的流程语义、storage 的持久化测试和桌面端的纯逻辑测试；Windows 平台模块的真实消息循环、托盘、剪贴板和窗口行为仍需按下节手动验收。只通过 `cargo check` 不能证明这些交互正确。
 
-仓库的 `.github/workflows/ci.yml` 在 `windows-2022` 上安装 stable MSVC 工具链和 `rustfmt`，依次执行格式检查、workspace 测试、workspace 检查和 NSIS 安装包构建；构建脚本执行 release 编译及 Windows GUI 子系统检查，避免启动时出现控制台窗口。随后用真实安装器检查安装、覆盖升级和卸载。测试步骤把 `APPDATA` 指向 GitHub Actions 的临时目录；workflow 不依赖开发机缓存、用户数据库或真实剪贴板。
+仓库的 `.github/workflows/ci.yml` 在 `windows-2022` 上安装 Rust 1.99.0 MSVC 工具链和 `rustfmt`，依次执行格式检查、workspace 测试、workspace 检查和 NSIS 安装包构建；构建脚本执行 release 编译及 Windows GUI 子系统检查，避免启动时出现控制台窗口。随后用真实安装器检查安装、覆盖升级和卸载。测试步骤把 `APPDATA` 指向 GitHub Actions 的临时目录；workflow 不依赖开发机缓存、用户数据库或真实剪贴板。
 
 本地安装包使用 NSIS。安装 NSIS 后执行 `./scripts/build-installer.ps1`，产物位于 `artifacts/veya-setup.exe`。组件页默认勾选开始菜单和桌面快捷方式；快捷方式使用随安装包部署、以图标内容摘要命名的独立 ICO，避免同一路径下 Explorer 沿用旧图标缓存。安装完成页提供启动 Veya 的选项；卸载会移除快捷方式、图标和程序文件。安装器就地覆盖旧版 `veya.exe`，保留用户历史和设置；卸载也不清理 `%APPDATA%\Veya`。实际安装、覆盖升级和卸载仍要用隔离数据目录及 Windows 虚拟机或测试机手动验收。
 

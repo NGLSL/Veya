@@ -15,8 +15,8 @@ jobs:
       - uses: actions/checkout@v4.4.0
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt
-          rustup default stable-x86_64-pc-windows-msvc
+          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt
+          rustup default 1.99.0-x86_64-pc-windows-msvc
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test workspace

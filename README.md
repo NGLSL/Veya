@@ -48,7 +48,7 @@ Veya 用 **Rust + Iced** 构建，剪贴板内容和历史记录存入本机 SQL
 
 ## 从源码构建
 
-需要 Rust stable 的 `x86_64-pc-windows-msvc` 工具链、Visual Studio Build Tools 和 Windows SDK。在仓库根目录运行：
+需要 Rust 1.99.0 的 `x86_64-pc-windows-msvc` 工具链、Visual Studio Build Tools 和 Windows SDK。仓库通过 `rust-toolchain.toml` 固定版本，使用 rustup 时会自动选择对应工具链。在仓库根目录运行：
 
 ```powershell
 cargo test --workspace
