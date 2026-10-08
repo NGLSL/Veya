@@ -8,7 +8,8 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
     GetClipboardOwner, GetClipboardSequenceNumber, GetOpenClipboardWindow,
-    IsClipboardFormatAvailable, OpenClipboard, RemoveClipboardFormatListener, SetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -34,6 +35,7 @@ const BI_JPEG: u32 = 4;
 const BI_PNG: u32 = 5;
 const BI_ALPHABITFIELDS: u32 = 6;
 const LCS_SRGB: u32 = 0x7352_4742;
+const LCS_GM_IMAGES: u32 = 4;
 
 const MAX_DIB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
@@ -353,8 +355,13 @@ pub fn write_payload(payload: &ClipboardPayload) -> Result<u32, ClipboardWriteEr
             write_global_payload(CF_HDROP, &bytes)
         }
         ClipboardPayload::Image { png, width, height } => {
-            let bytes = encode_dibv5(png, *width, *height)?;
-            write_global_payload(CF_DIBV5, &bytes)
+            let dibv5 = encode_dibv5(png, *width, *height)?;
+            let dib = encode_legacy_dib(&dibv5, *width, *height)?;
+            let png_format = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
+            if png_format == 0 {
+                return Err("无法注册 PNG 剪贴板格式".into());
+            }
+            write_global_payloads(&[(png_format, png), (CF_DIBV5, &dibv5), (CF_DIB, &dib)])
         }
     }
 }
@@ -445,6 +452,7 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
         .map_err(|_| "图片尺寸超出支持范围".to_string())?;
     let total = 124usize
         .checked_add(pixel_bytes)
+        .filter(|total| *total <= MAX_DIB_BYTES)
         .ok_or_else(|| "图片尺寸超出支持范围".to_string())?;
     let image_size = u32::try_from(pixel_bytes).map_err(|_| "图片数据超出支持大小".to_string())?;
 
@@ -464,6 +472,7 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
     write_u32(&mut dib, 48, 0x0000_00ff); // blue mask
     write_u32(&mut dib, 52, 0xff00_0000); // alpha mask
     write_u32(&mut dib, 56, LCS_SRGB);
+    write_u32(&mut dib, 108, LCS_GM_IMAGES);
 
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -472,8 +481,90 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
     Ok(dib)
 }
 
+/// Older consumers expect a 40-byte header with opaque, bottom-up BGR rows.
+/// The V5 buffer already contains decoded pixels, so do not decode PNG twice.
+fn encode_legacy_dib(dibv5: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let width = width as usize;
+    let height = height as usize;
+    let stride = width
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(3))
+        .map(|bytes| bytes & !3)
+        .ok_or("图片尺寸超出支持范围")?;
+    let pixel_bytes = stride.checked_mul(height).ok_or("图片尺寸超出支持范围")?;
+    let total = 40usize
+        .checked_add(pixel_bytes)
+        .filter(|total| *total <= MAX_DIB_BYTES)
+        .ok_or("图片数据超出支持大小")?;
+    let source_stride = width.checked_mul(4).ok_or("图片尺寸超出支持范围")?;
+    let source_bytes = source_stride
+        .checked_mul(height)
+        .ok_or("图片尺寸超出支持范围")?;
+    let pixels = dibv5
+        .get(124..)
+        .filter(|pixels| pixels.len() == source_bytes)
+        .ok_or("图片数据无效")?;
+    let mut dib = vec![0u8; total];
+    write_u32(&mut dib, 0, 40);
+    write_i32(&mut dib, 4, width as i32);
+    write_i32(&mut dib, 8, height as i32);
+    write_u16(&mut dib, 12, 1);
+    write_u16(&mut dib, 14, 24); // BI_RGB = 0, no masks or palette
+    write_u32(&mut dib, 20, pixel_bytes as u32);
+    for (row, source) in pixels.chunks_exact(source_stride).enumerate() {
+        let destination = 40 + (height - 1 - row) * stride;
+        for (column, pixel) in source.chunks_exact(4).enumerate() {
+            let alpha = u32::from(pixel[3]);
+            for channel in 0..3 {
+                // Composite straight alpha onto white for formats without alpha.
+                dib[destination + column * 3 + channel] =
+                    ((u32::from(pixel[channel]) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+            }
+        }
+    }
+    Ok(dib)
+}
+
+/// Frees only memory whose ownership has not passed to Windows.
+struct ClipboardBuffer(Option<HGLOBAL>);
+
+impl ClipboardBuffer {
+    unsafe fn new(bytes: &[u8]) -> Result<Self, String> {
+        let buffer = Self(Some(
+            GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+                .map_err(|error| format!("无法分配剪贴板内存：{error}"))?,
+        ));
+        let handle = buffer.0.unwrap();
+        let pointer = GlobalLock(handle);
+        if pointer.is_null() {
+            return Err("无法锁定剪贴板内存".to_string());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
+        let _ = GlobalUnlock(handle);
+        Ok(buffer)
+    }
+}
+
+impl Drop for ClipboardBuffer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            unsafe {
+                let _ = GlobalFree(Some(handle));
+            }
+        }
+    }
+}
+
 fn write_global_payload(format: u32, bytes: &[u8]) -> Result<u32, ClipboardWriteError> {
-    if bytes.is_empty() || bytes.len() > MAX_DIB_BYTES.max(MAX_TEXT_UNITS * 2) {
+    write_global_payloads(&[(format, bytes)])
+}
+
+fn write_global_payloads(payloads: &[(u32, &[u8])]) -> Result<u32, ClipboardWriteError> {
+    if payloads.is_empty()
+        || payloads.iter().any(|(_, bytes)| {
+            bytes.is_empty() || bytes.len() > MAX_DIB_BYTES.max(MAX_TEXT_UNITS * 2)
+        })
+    {
         return Err("剪贴板数据超出支持大小".into());
     }
     let _access = CLIPBOARD_ACCESS
@@ -481,32 +572,29 @@ fn write_global_payload(format: u32, bytes: &[u8]) -> Result<u32, ClipboardWrite
         .map_err(|_| "无法写入剪贴板：剪贴板访问锁已失效。".to_string())?;
     unsafe {
         let owner = clipboard_owner_hwnd().ok_or_else(|| "剪贴板窗口尚未启动".to_string())?;
-        let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
-            .map_err(|error| format!("无法分配剪贴板内存：{error}"))?;
-        let pointer = GlobalLock(hglobal);
-        if pointer.is_null() {
-            let _ = GlobalFree(Some(hglobal));
-            return Err("无法锁定剪贴板内存".into());
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
-        let _ = GlobalUnlock(hglobal);
+        // Prepare every format before clearing the current clipboard.
+        let mut buffers = payloads
+            .iter()
+            .map(|(_, bytes)| ClipboardBuffer::new(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
 
         if let Err(error) = OpenClipboard(Some(owner)) {
-            let _ = GlobalFree(Some(hglobal));
             return Err(format!("无法打开剪贴板：{error}").into());
         }
         if let Err(error) = EmptyClipboard() {
             let _ = CloseClipboard();
-            let _ = GlobalFree(Some(hglobal));
             return Err(format!("无法清空剪贴板：{error}").into());
         }
         // From here onward, this attempt has already changed the clipboard,
         // even if writing or read-only confirmation subsequently fails.
         let changed_result: Result<u32, String> = (|| {
-            if let Err(error) = SetClipboardData(format, Some(HANDLE(hglobal.0 as *mut _))) {
-                let _ = GlobalFree(Some(hglobal));
-                let _ = CloseClipboard();
-                return Err(format!("无法写入剪贴板：{error}"));
+            for ((format, _), buffer) in payloads.iter().zip(&mut buffers) {
+                let hglobal = buffer.0.unwrap();
+                if let Err(error) = SetClipboardData(*format, Some(HANDLE(hglobal.0 as *mut _))) {
+                    let _ = CloseClipboard();
+                    return Err(format!("无法写入剪贴板：{error}"));
+                }
+                buffer.0 = None;
             }
             // Closing a write can advance the sequence while Windows adds automatic
             // formats. Reopen read-only and bind the settled sequence to our owner
@@ -518,23 +606,26 @@ fn write_global_payload(format: u32, bytes: &[u8]) -> Result<u32, ClipboardWrite
                 if GetClipboardOwner().unwrap_or_default() != owner {
                     return Err("剪贴板已变化，请重新选择。".to_string());
                 }
-                let handle = GetClipboardData(format)
-                    .map_err(|error| format!("无法确认剪贴板内容，请重新选择：{error}"))?;
-                let current = HGLOBAL(handle.0);
-                if GlobalSize(current) < bytes.len() {
-                    return Err("剪贴板已变化，请重新选择。".to_string());
-                }
-                let pointer = GlobalLock(current);
-                if pointer.is_null() {
-                    return Err("无法确认剪贴板内存，请重新选择。".to_string());
-                }
-                // Borrow only the payload range; GlobalAlloc may add trailing padding.
-                // The system owns this handle after SetClipboardData, so never free it.
-                let current_bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), bytes.len());
-                let matches = replay_bytes_match(bytes, current_bytes);
-                let _ = GlobalUnlock(current);
-                if !matches {
-                    return Err("剪贴板已变化，请重新选择。".to_string());
+                for (format, bytes) in payloads {
+                    let handle = GetClipboardData(*format)
+                        .map_err(|error| format!("无法确认剪贴板内容，请重新选择：{error}"))?;
+                    let current = HGLOBAL(handle.0);
+                    if GlobalSize(current) < bytes.len() {
+                        return Err("剪贴板已变化，请重新选择。".to_string());
+                    }
+                    let pointer = GlobalLock(current);
+                    if pointer.is_null() {
+                        return Err("无法确认剪贴板内存，请重新选择。".to_string());
+                    }
+                    // Borrow only the payload range; GlobalAlloc may add trailing padding.
+                    // The system owns this handle after SetClipboardData, so never free it.
+                    let current_bytes =
+                        std::slice::from_raw_parts(pointer.cast::<u8>(), bytes.len());
+                    let matches = replay_bytes_match(bytes, current_bytes);
+                    let _ = GlobalUnlock(current);
+                    if !matches {
+                        return Err("剪贴板已变化，请重新选择。".to_string());
+                    }
                 }
                 Ok(GetClipboardSequenceNumber())
             })();
