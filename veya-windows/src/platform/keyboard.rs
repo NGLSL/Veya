@@ -15,8 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::time::now_ms;
-use super::win::emit;
-use super::{PasteTriggerRaw, PlatformEvent};
+use super::PasteTriggerRaw;
 use veya_core::PasteMethod;
 
 static HOOK: AtomicIsize = AtomicIsize::new(0);
@@ -115,11 +114,11 @@ fn emit_paste(method: PasteMethod) {
         if !hwnd.0.is_null() {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
         }
-        emit(PlatformEvent::PasteTrigger(PasteTriggerRaw {
+        super::clipboard::emit_paste(PasteTriggerRaw {
             target_hwnd: hwnd.0 as isize,
             target_pid: pid,
             method,
             timestamp_ms: now_ms(),
-        }));
+        });
     }
 }

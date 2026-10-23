@@ -210,6 +210,30 @@ impl App {
                     .height(Length::Fixed(92.0))
                     .into()
             }
+            crate::capture::CardPayloadView::VideoFile { path, handle, .. } => {
+                let mut preview = column![].spacing(10);
+                if let Some(handle) = handle {
+                    preview = preview.push(
+                        container(
+                            iced::widget::image(handle.clone())
+                                .width(Length::Fixed(240.0))
+                                .height(Length::Fixed(160.0)),
+                        )
+                        .width(Length::Fill)
+                        .center_x(Length::Fill)
+                        .style(theme::inset_style),
+                    );
+                }
+                preview
+                    .push(
+                        text(path.clone())
+                            .size(12)
+                            .color(theme::INK)
+                            .font(crate::font::ui_font())
+                            .shaping(text::Shaping::Advanced),
+                    )
+                    .into()
+            }
             crate::capture::CardPayloadView::Image {
                 handle,
                 thumbnail_failed,
@@ -732,6 +756,10 @@ impl App {
 
 fn detail_type_visual<'a>(card: &'a CardView, size: f32) -> Element<'a, Message> {
     if let crate::capture::CardPayloadView::Image {
+        handle: Some(handle),
+        ..
+    }
+    | crate::capture::CardPayloadView::VideoFile {
         handle: Some(handle),
         ..
     } = &card.payload

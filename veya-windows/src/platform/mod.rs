@@ -6,6 +6,7 @@ pub mod chrome;
 pub mod clipboard;
 #[cfg(windows)]
 pub mod elevation;
+pub mod file_thumbnail;
 #[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
@@ -110,13 +111,38 @@ pub struct ClipboardChangeRaw {
     pub timestamp_ms: i64,
 }
 
-/// Clipboard bytes copied while the Windows clipboard is open. Image DIBs are
-/// normalized to the core's PNG payload after the clipboard lock is released.
+/// Clipboard bytes copied while the Windows clipboard is open. Image candidates
+/// are normalized to the core's PNG payload after the clipboard lock is released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardPayloadRaw {
     Text(String),
     Files(Vec<String>),
-    Dib { format: u32, bytes: Vec<u8> },
+    Png(Vec<u8>),
+    Dib {
+        format: u32,
+        bytes: Vec<u8>,
+    },
+    Images(Vec<ClipboardImageRaw>),
+    FileWithImages {
+        path: String,
+        images: Vec<ClipboardImageRaw>,
+    },
+}
+
+/// Prioritized representations of one clipboard image, decoded on the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImageRaw {
+    pub format: ClipboardImageFormat,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardImageFormat {
+    Dib(u32),
+    Png,
+    Jpeg,
+    WebP,
+    Gif,
 }
 
 /// Cheap paste signal from the keyboard hook (names resolved later).
@@ -142,6 +168,18 @@ pub fn enrich_clipboard(raw: ClipboardChangeRaw) -> Option<ClipboardChange> {
     let payload = match raw.payload {
         ClipboardPayloadRaw::Text(text) => ClipboardPayload::Text(text),
         ClipboardPayloadRaw::Files(paths) => ClipboardPayload::Files(paths),
+        ClipboardPayloadRaw::Png(png) => {
+            #[cfg(windows)]
+            {
+                let (width, height) = clipboard::png_dimensions(&png)?;
+                ClipboardPayload::Image { png, width, height }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = png;
+                return None;
+            }
+        }
         ClipboardPayloadRaw::Dib { format, bytes } => {
             #[cfg(windows)]
             {
@@ -152,6 +190,31 @@ pub fn enrich_clipboard(raw: ClipboardChangeRaw) -> Option<ClipboardChange> {
             {
                 let _ = (format, bytes);
                 return None;
+            }
+        }
+        ClipboardPayloadRaw::Images(images) => {
+            #[cfg(windows)]
+            {
+                images.into_iter().find_map(clipboard::normalize_image)?
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = images;
+                return None;
+            }
+        }
+        ClipboardPayloadRaw::FileWithImages { path, images } => {
+            #[cfg(windows)]
+            {
+                images
+                    .into_iter()
+                    .find_map(clipboard::normalize_image)
+                    .unwrap_or_else(|| ClipboardPayload::Files(vec![path]))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = images;
+                ClipboardPayload::Files(vec![path])
             }
         }
     };

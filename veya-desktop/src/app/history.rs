@@ -459,6 +459,10 @@ pub(super) fn card_leading_visual<'a>(card: &'a CardView, size: f32) -> Element<
     if let crate::capture::CardPayloadView::Image {
         handle: Some(handle),
         ..
+    }
+    | crate::capture::CardPayloadView::VideoFile {
+        handle: Some(handle),
+        ..
     } = &card.payload
     {
         let inner = (size - 4.0).max(1.0);

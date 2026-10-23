@@ -1,9 +1,11 @@
 //! Clipboard capture and replay. Win32 clipboard ownership stays in this module.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use image::ImageFormat;
+use image::{ImageDecoder, ImageFormat};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -15,15 +17,47 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, KillTimer, SetTimer,
+};
 
 use super::time::now_ms;
 use super::win::{clipboard_owner_hwnd, emit};
-use super::{ClipboardChangeRaw, ClipboardPayloadRaw, ClipboardWriteError, PlatformEvent};
+use super::{
+    ClipboardChangeRaw, ClipboardImageFormat, ClipboardImageRaw, ClipboardPayloadRaw,
+    ClipboardWriteError, PasteTriggerRaw, PlatformEvent,
+};
 use veya_core::{ClipboardPayload, SourceConfidence};
 
 /// Sent to the window when clipboard content changes.
 pub const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+
+pub const RETRY_TIMER_ID: usize = 0x5643;
+const RETRY_INTERVAL_MS: u32 = 25;
+const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_DEFERRED_PASTES: usize = 32;
+
+struct PendingCapture {
+    sequence: u32,
+    owner_hwnd: isize,
+    source_pid: u32,
+    source_confidence: SourceConfidence,
+    timestamp_ms: i64,
+    started: Instant,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    pending: Option<PendingCapture>,
+    reading: bool,
+    completed: Option<u32>,
+    deferred_pastes: Vec<(u32, PasteTriggerRaw)>,
+}
+
+thread_local! {
+    // Both the window callback and low-level keyboard hook run on the pump thread.
+    static CAPTURE: RefCell<CaptureState> = RefCell::new(CaptureState::default());
+}
 
 const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
@@ -39,6 +73,7 @@ const LCS_GM_IMAGES: u32 = 4;
 
 const MAX_DIB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IMAGE_CANDIDATE_BYTES: usize = MAX_DIB_BYTES + MAX_PNG_BYTES;
 const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_FILE_COUNT: u32 = 4096;
 const MAX_PATH_UNITS: usize = 32_767;
@@ -57,7 +92,9 @@ pub fn install_listener(hwnd: HWND) -> windows::core::Result<()> {
 }
 
 pub fn uninstall_listener(hwnd: HWND) {
+    CAPTURE.with(|state| *state.borrow_mut() = CaptureState::default());
     unsafe {
+        let _ = KillTimer(Some(hwnd), RETRY_TIMER_ID);
         let _ = RemoveClipboardFormatListener(hwnd);
     }
 }
@@ -98,81 +135,300 @@ fn resolve_source() -> (isize, u32, SourceConfidence) {
     (0, 0, SourceConfidence::Unknown)
 }
 
-pub fn handle_clipboard_update(hwnd: HWND) {
-    let _access = match CLIPBOARD_ACCESS.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            eprintln!("无法读取剪贴板：剪贴板访问锁已失效。");
-            emit(PlatformEvent::ClipboardSkipped {
-                sequence: unsafe { GetClipboardSequenceNumber() },
-            });
-            return;
+/// Hold paste observations until their clipboard sequence has a final result.
+/// A newer write invalidates observations waiting for the previous payload.
+fn defer_paste(raw: &PasteTriggerRaw) -> bool {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    CAPTURE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.completed == Some(sequence) && state.pending.is_none() {
+            return false;
         }
-    };
-    let initial_sequence = unsafe { GetClipboardSequenceNumber() };
-    let (mut owner_hwnd, mut source_pid, mut source_confidence) = resolve_source();
-    let Some((sequence, payload)) = read_clipboard_payload(hwnd) else {
-        emit(PlatformEvent::ClipboardSkipped {
-            sequence: initial_sequence,
-        });
-        return;
-    };
+        state.deferred_pastes.retain(|(seq, _)| *seq == sequence);
+        if state.deferred_pastes.len() < MAX_DEFERRED_PASTES {
+            state.deferred_pastes.push((sequence, raw.clone()));
+        }
+        true
+    })
+}
 
-    // The owner was observed before opening the clipboard. If a newer write
-    // raced with that observation, its source cannot be claimed as exact.
-    if sequence != initial_sequence {
+pub fn emit_paste(raw: PasteTriggerRaw) {
+    if !defer_paste(&raw) {
+        emit(PlatformEvent::PasteTrigger(raw));
+    }
+}
+
+pub fn handle_clipboard_update(hwnd: HWND) {
+    begin_capture(hwnd, false);
+}
+
+fn begin_capture(hwnd: HWND, from_timer: bool) {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    let already_seen = CAPTURE.with(|state| {
+        let state = state.borrow();
+        state.reading
+            || state.completed == Some(sequence)
+            || state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.sequence == sequence)
+    });
+    if already_seen {
+        return;
+    }
+    let (mut owner_hwnd, mut source_pid, mut source_confidence) = resolve_source();
+    // A timer can discover a new write before its notification is dispatched.
+    // Only an actual owner proves its source; the current foreground may have changed.
+    if from_timer && source_confidence != SourceConfidence::Exact {
         owner_hwnd = 0;
         source_pid = 0;
         source_confidence = SourceConfidence::Unknown;
     }
-
-    emit(PlatformEvent::ClipboardChange(ClipboardChangeRaw {
-        sequence,
-        payload,
-        owner_hwnd,
-        source_pid,
-        source_confidence,
-        timestamp_ms: now_ms(),
-    }));
+    CAPTURE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.deferred_pastes.retain(|(seq, _)| *seq == sequence);
+        state.pending = Some(PendingCapture {
+            sequence,
+            owner_hwnd,
+            source_pid,
+            source_confidence,
+            timestamp_ms: now_ms(),
+            started: Instant::now(),
+        });
+    });
+    attempt_capture(hwnd);
 }
 
-/// Copy exactly one prioritized payload while holding the clipboard lock.
-/// DIB decoding and PNG encoding happen later, on the worker.
-/// The only caller, `handle_clipboard_update`, holds `CLIPBOARD_ACCESS`.
-fn read_clipboard_payload(hwnd: HWND) -> Option<(u32, ClipboardPayloadRaw)> {
+pub fn handle_retry_timer(hwnd: HWND) {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    let changed = CAPTURE.with(|state| {
+        state
+            .borrow()
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.sequence != sequence)
+    });
+    if changed {
+        begin_capture(hwnd, true);
+    } else {
+        attempt_capture(hwnd);
+    }
+}
+
+fn attempt_capture(hwnd: HWND) {
+    let reading = CAPTURE.with(|state| state.borrow().reading);
+    if reading {
+        return;
+    }
+    let Some(sequence) = CAPTURE.with(|state| {
+        state
+            .borrow()
+            .pending
+            .as_ref()
+            .map(|pending| pending.sequence)
+    }) else {
+        return;
+    };
+    // Replay owns the same HWND on the worker. Never wait for its mutex in the
+    // message pump: hotkeys and shutdown must remain responsive while retrying.
+    // Delayed rendering can pump nested window messages. The nested update is
+    // handled by the next timer tick after the current read releases its locks.
+    CAPTURE.with(|state| state.borrow_mut().reading = true);
+    let result = match CLIPBOARD_ACCESS.try_lock() {
+        Ok(_access) => read_clipboard_payload(hwnd, sequence),
+        Err(std::sync::TryLockError::WouldBlock) => CaptureRead::Retry,
+        Err(std::sync::TryLockError::Poisoned(_)) => CaptureRead::Complete(None),
+    };
+    CAPTURE.with(|state| state.borrow_mut().reading = false);
+    let payload = match result {
+        CaptureRead::Changed => {
+            // Do not publish bytes from a newer write under the pending identity.
+            // Its queued notification (or next timer tick) starts a fresh capture.
+            if unsafe { SetTimer(Some(hwnd), RETRY_TIMER_ID, RETRY_INTERVAL_MS, None) } != 0 {
+                return;
+            }
+            None
+        }
+        CaptureRead::Retry => {
+            let expired = CAPTURE.with(|state| {
+                state
+                    .borrow()
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| pending.started.elapsed() >= RETRY_TIMEOUT)
+            });
+            if !expired
+                && unsafe { SetTimer(Some(hwnd), RETRY_TIMER_ID, RETRY_INTERVAL_MS, None) } != 0
+            {
+                return;
+            }
+            None
+        }
+        CaptureRead::Complete(payload) => payload,
+    };
     unsafe {
-        OpenClipboard(Some(hwnd)).ok()?;
-        let result = (|| {
-            let sequence = GetClipboardSequenceNumber();
+        let _ = KillTimer(Some(hwnd), RETRY_TIMER_ID);
+    }
+    let (pending, pastes) = CAPTURE.with(|state| {
+        let mut state = state.borrow_mut();
+        let pending = state.pending.take().unwrap();
+        state.completed = Some(pending.sequence);
+        (pending, std::mem::take(&mut state.deferred_pastes))
+    });
+    match payload {
+        Some(payload) => emit(PlatformEvent::ClipboardChange(ClipboardChangeRaw {
+            sequence: pending.sequence,
+            payload,
+            owner_hwnd: pending.owner_hwnd,
+            source_pid: pending.source_pid,
+            source_confidence: pending.source_confidence,
+            timestamp_ms: pending.timestamp_ms,
+        })),
+        None => emit(PlatformEvent::ClipboardSkipped {
+            sequence: pending.sequence,
+        }),
+    }
+    for (sequence, paste) in pastes {
+        if sequence == pending.sequence {
+            emit(PlatformEvent::PasteTrigger(paste));
+        }
+    }
+}
+
+enum CaptureRead {
+    Retry,
+    Changed,
+    Complete(Option<ClipboardPayloadRaw>),
+}
+
+/// Copy one prioritized payload; decoding happens later on the worker.
+/// The caller holds `CLIPBOARD_ACCESS` without blocking the message pump.
+fn read_clipboard_payload(hwnd: HWND, expected_sequence: u32) -> CaptureRead {
+    unsafe {
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return CaptureRead::Retry;
+        }
+        let result = if GetClipboardSequenceNumber() != expected_sequence {
+            CaptureRead::Changed
+        } else {
             let payload = if format_available(CF_HDROP) {
-                ClipboardPayloadRaw::Files(read_hdrop()?)
-            } else if format_available(CF_DIBV5) {
-                ClipboardPayloadRaw::Dib {
-                    format: CF_DIBV5,
-                    bytes: read_global_data(CF_DIBV5, MAX_DIB_BYTES)?,
-                }
-            } else if format_available(CF_DIB) {
-                ClipboardPayloadRaw::Dib {
-                    format: CF_DIB,
-                    bytes: read_global_data(CF_DIB, MAX_DIB_BYTES)?,
-                }
-            } else if format_available(CF_UNICODETEXT) {
-                ClipboardPayloadRaw::Text(read_unicode_text()?)
+                read_hdrop().map(|mut paths| {
+                    // Messaging apps can publish one temporary file alongside
+                    // image pixels. Prefer a valid image, retaining the file as
+                    // fallback; multi-file copies keep their original meaning.
+                    if paths.len() == 1 {
+                        let (_, images) = read_image_candidates();
+                        if !images.is_empty() {
+                            return ClipboardPayloadRaw::FileWithImages {
+                                path: paths.remove(0),
+                                images,
+                            };
+                        }
+                    }
+                    ClipboardPayloadRaw::Files(paths)
+                })
             } else {
-                return None;
+                let (has_images, images) = read_image_candidates();
+                if has_images {
+                    // Never turn a failed image into a browser's accompanying URL text.
+                    (!images.is_empty()).then_some(ClipboardPayloadRaw::Images(images))
+                } else if format_available(CF_UNICODETEXT) {
+                    read_unicode_text().map(ClipboardPayloadRaw::Text)
+                } else {
+                    let _ = CloseClipboard();
+                    return CaptureRead::Complete(None);
+                }
             };
-            Some((sequence, payload))
-        })();
+            // Delayed-rendering owners may advance the sequence while serving GetClipboardData.
+            if GetClipboardSequenceNumber() != expected_sequence {
+                CaptureRead::Changed
+            } else {
+                payload.map_or(CaptureRead::Retry, |payload| {
+                    CaptureRead::Complete(Some(payload))
+                })
+            }
+        };
         let _ = CloseClipboard();
         result
     }
 }
 
-fn format_available(format: u32) -> bool {
-    unsafe { IsClipboardFormatAvailable(format).is_ok() }
+/// Retain bounded alternatives so one malformed representation cannot mask another.
+/// Each DIB keeps its existing 64 MiB allowance; each encoded-image family shares
+/// 32 MiB across aliases, within a 96 MiB total including the next read.
+unsafe fn read_image_candidates() -> (bool, Vec<ClipboardImageRaw>) {
+    let mut available = false;
+    let mut candidates = Vec::new();
+    let mut budget = MAX_IMAGE_CANDIDATE_BYTES;
+    for format in [CF_DIBV5, CF_DIB] {
+        if format_available(format) {
+            available = true;
+            if let Some(bytes) = read_image_data(
+                format,
+                MAX_DIB_BYTES.min(budget),
+                ClipboardImageFormat::Dib(format),
+                &candidates,
+            ) {
+                budget -= bytes.len();
+                candidates.push(ClipboardImageRaw {
+                    format: ClipboardImageFormat::Dib(format),
+                    bytes,
+                });
+            }
+        }
+    }
+    for (kind, names) in [
+        (
+            ClipboardImageFormat::Png,
+            &["PNG", "image/png", "image/x-png"][..],
+        ),
+        (
+            ClipboardImageFormat::Jpeg,
+            &[
+                "JFIF",
+                "JPEG",
+                "JPG",
+                "image/jpeg",
+                "image/jpg",
+                "image/pjpeg",
+            ][..],
+        ),
+        (ClipboardImageFormat::WebP, &["WebP", "image/webp"][..]),
+        (ClipboardImageFormat::Gif, &["GIF", "image/gif"][..]),
+    ] {
+        let mut remaining = MAX_PNG_BYTES;
+        let mut formats = Vec::new();
+        for name in names {
+            let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let format = RegisterClipboardFormatW(windows::core::PCWSTR(name.as_ptr()));
+            if format == 0 || formats.contains(&format) {
+                continue;
+            }
+            formats.push(format);
+            if !format_available(format) {
+                continue;
+            }
+            available = true;
+            if let Some(bytes) = read_image_data(format, remaining.min(budget), kind, &candidates) {
+                remaining -= bytes.len();
+                budget -= bytes.len();
+                candidates.push(ClipboardImageRaw {
+                    format: kind,
+                    bytes,
+                });
+            }
+        }
+    }
+    (available, candidates)
 }
 
-unsafe fn read_global_data(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
+/// Compare aliases while borrowing the OS allocation, before allocating a copy.
+unsafe fn read_image_data(
+    format: u32,
+    max_bytes: usize,
+    kind: ClipboardImageFormat,
+    candidates: &[ClipboardImageRaw],
+) -> Option<Vec<u8>> {
     let handle = GetClipboardData(format).ok()?;
     let hglobal = HGLOBAL(handle.0);
     let size = GlobalSize(hglobal);
@@ -183,9 +439,95 @@ unsafe fn read_global_data(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
     if locked.is_null() {
         return None;
     }
-    let bytes = std::slice::from_raw_parts(locked.cast::<u8>(), size).to_vec();
+    let bytes = std::slice::from_raw_parts(locked.cast::<u8>(), size);
+    let duplicate = candidates
+        .iter()
+        .any(|candidate| candidate.format == kind && candidate.bytes == bytes);
+    let result = (!duplicate).then(|| bytes.to_vec());
     let _ = GlobalUnlock(hglobal);
-    Some(bytes)
+    result
+}
+
+pub fn normalize_image(candidate: ClipboardImageRaw) -> Option<ClipboardPayload> {
+    let ClipboardImageRaw { format, bytes } = candidate;
+    let (png, width, height) = match format {
+        ClipboardImageFormat::Dib(format) => dib_to_png(format, &bytes)?,
+        ClipboardImageFormat::Png => {
+            let (width, height) = png_dimensions(&bytes)?;
+            (bytes, width, height)
+        }
+        format => {
+            let format = match format {
+                ClipboardImageFormat::Jpeg => ImageFormat::Jpeg,
+                ClipboardImageFormat::WebP => ImageFormat::WebP,
+                ClipboardImageFormat::Gif => ImageFormat::Gif,
+                _ => unreachable!(),
+            };
+            let decoded = decode_bounded(&bytes, format, MAX_PNG_BYTES)?;
+            let (width, height) = (decoded.width(), decoded.height());
+            let png = encode_png(decoded)?;
+            (png, width, height)
+        }
+    };
+    Some(ClipboardPayload::Image { png, width, height })
+}
+
+/// ImageDecoder::read_image reads only the first GIF/WebP frame, without
+/// collecting animation frames. Validate dimensions before allocating pixels.
+fn decode_bounded(
+    bytes: &[u8],
+    format: ImageFormat,
+    max_encoded_bytes: usize,
+) -> Option<image::DynamicImage> {
+    if bytes.is_empty() || bytes.len() > max_encoded_bytes {
+        return None;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_PIXELS as u32);
+    limits.max_image_height = Some(MAX_IMAGE_PIXELS as u32);
+    limits.max_alloc = Some(MAX_DIB_BYTES as u64);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    // Share the 64 MiB decoding budget between output pixels and decoder scratch.
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    image::DynamicImage::from_decoder(decoder).ok()
+}
+
+fn encode_png(decoded: image::DynamicImage) -> Option<Vec<u8>> {
+    let mut png = Vec::new();
+    decoded
+        .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+        .ok()?;
+    (!png.is_empty() && png.len() <= MAX_PNG_BYTES).then_some(png)
+}
+
+/// Validate a registered PNG before retaining its original bytes and alpha.
+pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.is_empty() || bytes.len() > MAX_PNG_BYTES {
+        return None;
+    }
+    let mut decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(MAX_DIB_BYTES as u64);
+    decoder.set_limits(limits).ok()?;
+    image::DynamicImage::from_decoder(decoder).ok()?;
+    Some((width, height))
+}
+
+fn format_available(format: u32) -> bool {
+    unsafe { IsClipboardFormatAvailable(format).is_ok() }
 }
 
 unsafe fn read_hdrop() -> Option<Vec<String>> {
@@ -277,7 +619,22 @@ pub fn dib_to_png(format: u32, bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
         let end = header_size.checked_add(size_image)?;
         let encoded = bytes.get(header_size..end)?;
-        image::load_from_memory(encoded).ok()?
+        let format = if compression == BI_PNG {
+            ImageFormat::Png
+        } else {
+            ImageFormat::Jpeg
+        };
+        // Preserve the existing DIB decoder allocation conditions, including
+        // 16-bit PNGs whose decoded storage can exceed 64 MiB. The outer DIB
+        // already bounds input bytes and pixels; validate the actual dimensions
+        // before pixel allocation rather than applying registered-format limits.
+        let decoder = image::ImageReader::with_format(std::io::Cursor::new(encoded), format)
+            .into_decoder()
+            .ok()?;
+        if decoder.dimensions() != (width, height) {
+            return None;
+        }
+        image::DynamicImage::from_decoder(decoder).ok()?
     } else {
         let bitfield_bytes = match (header_size, compression) {
             (40, BI_BITFIELDS) => 12usize,

@@ -1,14 +1,16 @@
 //! Latest-request history loader. Original pixels never enter the capture thread.
 use super::{HISTORY_PAGE_SIZE, HISTORY_READ_BATCH};
-use crate::capture::{card_view_from_summary, CardView, HistoryQuery};
+use crate::capture::{card_view_from_summary, CardPayloadView, CardView, HistoryQuery};
 use crate::format;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use veya_core::{ClipboardPayload, HistoryAggregator, HistorySummary};
 use veya_storage::{Store, Thumbnail};
+use veya_windows::platform::file_thumbnail::ThumbnailReader;
 
 struct Request {
     generation: u64,
@@ -17,6 +19,7 @@ struct Request {
 #[derive(Default)]
 struct Mailbox {
     request: Option<Request>,
+    release_previews: bool,
     stopped: bool,
 }
 pub(super) enum ResultEvent {
@@ -61,30 +64,53 @@ impl Loader {
             .name("veya-history".into())
             .spawn(move || {
                 let mut store = Store::open(&path).map_err(|e| format!("读取历史失败：{e}"));
+                let mut files = FilePreviews::default();
                 loop {
-                    let request = {
+                    let (request, release_previews) = {
                         let (lock, ready) = &*work;
                         let mut state = lock.lock().unwrap();
-                        while state.request.is_none() && !state.stopped {
+                        while state.request.is_none() && !state.release_previews && !state.stopped {
                             state = ready.wait(state).unwrap();
                         }
                         if state.stopped {
                             break;
                         }
-                        state.request.take().unwrap()
+                        (state.request.take(), std::mem::take(&mut state.release_previews))
                     };
+                    if release_previews {
+                        // COM initialization and teardown stay on the history thread.
+                        files = FilePreviews::default();
+                    }
+                    let Some(request) = request else { continue };
                     let current = || epoch.load(Ordering::Acquire) == request.generation;
                     let result = match &mut store {
                         Ok(store) => load_page(store, &request.query, &current),
                         Err(message) => Err(message.clone()),
                     };
                     match result {
-                        Ok(Some((cards, has_next))) => {
-                            let images: Vec<_> = cards
+                        Ok(Some((mut cards, has_next))) => {
+                            for card in &mut cards {
+                                if let CardPayloadView::Files(paths) = &card.payload {
+                                    if paths.len() == 1 && is_video_path(Path::new(&paths[0])) {
+                                        card.payload = CardPayloadView::VideoFile {
+                                            path: paths[0].clone(),
+                                            handle: None,
+                                            thumbnail_failed: false,
+                                        };
+                                    }
+                                }
+                            }
+                            files.cache.retain(|path, _| cards.iter().any(|card| {
+                                matches!(&card.payload, CardPayloadView::VideoFile { path: candidate, .. } if candidate == path)
+                            }));
+                            let previews: Vec<_> = cards
                                 .iter()
-                                .filter_map(|card| match card.payload {
-                                    crate::capture::CardPayloadView::Image { .. } => {
-                                        Some((card.sequence, card.content_hash.clone()))
+                                .filter_map(|card| match &card.payload {
+                                    CardPayloadView::Image { .. } => {
+                                        Some((card.sequence, card.content_hash.clone(), None))
+                                    }
+                                    CardPayloadView::VideoFile { path, .. } => {
+                                        Some((card.sequence, card.content_hash.clone(), Some(path.clone())))
                                     }
                                     _ => None,
                                 })
@@ -109,18 +135,22 @@ impl Loader {
                                 continue;
                             }
                             if let Ok(store) = &mut store {
-                                for (sequence, hash) in images {
+                                for (sequence, hash, path) in previews {
                                     if !current() {
                                         break;
                                     }
-                                    if let Some(thumbnail) =
-                                        load_thumbnail(store, sequence, &hash, &current)
-                                    {
-                                        let handle = iced::widget::image::Handle::from_rgba(
-                                            thumbnail.width,
-                                            thumbnail.height,
-                                            thumbnail.rgba,
-                                        );
+                                    let handle = if let Some(path) = path {
+                                        files.read(Path::new(&path))
+                                    } else {
+                                        load_thumbnail(store, sequence, &hash, &current).map(|thumbnail| {
+                                            iced::widget::image::Handle::from_rgba(
+                                                thumbnail.width,
+                                                thumbnail.height,
+                                                thumbnail.rgba,
+                                            )
+                                        })
+                                    };
+                                    if let Some(handle) = handle {
                                         if !send(
                                             &tx,
                                             ResultEvent::Thumbnail {
@@ -180,6 +210,15 @@ impl Loader {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
     }
+    pub fn deactivate(&self) -> u64 {
+        let generation = self.cancel();
+        let (lock, ready) = &*self.mailbox;
+        let mut state = lock.lock().unwrap();
+        state.request = None;
+        state.release_previews = true;
+        ready.notify_one();
+        generation
+    }
     pub fn request(&self, query: &HistoryQuery) -> u64 {
         let generation = self.cancel();
         let (lock, ready) = &*self.mailbox;
@@ -217,6 +256,76 @@ fn send(tx: &SyncSender<ResultEvent>, mut event: ResultEvent, current: &impl Fn(
         }
     }
     false
+}
+/// Only the current page is retained; file metadata invalidates both hits and misses.
+#[derive(Default)]
+struct FilePreviews {
+    reader: Option<ThumbnailReader>,
+    cache: HashMap<String, FilePreview>,
+}
+struct FilePreview {
+    version: Option<(u64, SystemTime)>,
+    attempted: Instant,
+    handle: Option<iced::widget::image::Handle>,
+}
+impl FilePreviews {
+    fn read(&mut self, path: &Path) -> Option<iced::widget::image::Handle> {
+        let version = std::fs::metadata(path)
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| Some((m.len(), m.modified().ok()?)));
+        let key = path.to_string_lossy().into_owned();
+        if let Some(cached) = self.cache.get(&key) {
+            if cached.version == version
+                && (cached.handle.is_some() || cached.attempted.elapsed() < Duration::from_secs(30))
+            {
+                return cached.handle.clone();
+            }
+        }
+        let handle = version.and_then(|_| {
+            if self.reader.is_none() {
+                self.reader = ThumbnailReader::new();
+            }
+            let thumbnail = self.reader.as_ref()?.read(path, 128)?;
+            Some(iced::widget::image::Handle::from_rgba(
+                thumbnail.width,
+                thumbnail.height,
+                thumbnail.rgba,
+            ))
+        });
+        self.cache.insert(
+            key,
+            FilePreview {
+                version,
+                attempted: Instant::now(),
+                handle: handle.clone(),
+            },
+        );
+        handle
+    }
+}
+fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp4"
+                    | "m4v"
+                    | "mov"
+                    | "mkv"
+                    | "avi"
+                    | "webm"
+                    | "wmv"
+                    | "mpeg"
+                    | "mpg"
+                    | "3gp"
+                    | "3g2"
+                    | "ts"
+                    | "mts"
+                    | "m2ts"
+            )
+        })
 }
 fn load_thumbnail(
     store: &mut Store,

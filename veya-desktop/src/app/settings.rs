@@ -369,16 +369,10 @@ impl App {
             column![
                 row![
                     icons::icon(Icon::History, theme::ACCENT, 20.0),
-                    column![
-                        body(format!("Veya v{}", env!("CARGO_PKG_VERSION")))
-                            .size(13)
-                            .font(crate::font::name_font()),
-                        meta("Clipboard Flow Tracker · 记住从哪来，去向何处。")
-                            .size(11)
-                            .color(theme::MUTED),
-                    ]
-                    .spacing(2)
-                    .width(Length::Fill),
+                    body(format!("Veya v{}", env!("CARGO_PKG_VERSION")))
+                        .size(13)
+                        .font(crate::font::name_font())
+                        .width(Length::Fill),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),

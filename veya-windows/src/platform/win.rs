@@ -12,7 +12,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, PostQuitMessage,
-    TranslateMessage, MSG, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY,
+    TranslateMessage, MSG, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_TIMER,
 };
 
 use super::clipboard;
@@ -198,6 +198,10 @@ pub(crate) unsafe extern "system" fn message_wnd_proc(
     match msg {
         clipboard::WM_CLIPBOARDUPDATE => {
             clipboard::handle_clipboard_update(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == clipboard::RETRY_TIMER_ID => {
+            clipboard::handle_retry_timer(hwnd);
             LRESULT(0)
         }
         WM_HOTKEY => {

@@ -221,7 +221,7 @@ impl HistoryPage {
         if !active {
             if self.query.is_some() || self.loading {
                 if let Some(loader) = &self.loader {
-                    self.generation = loader.cancel();
+                    self.generation = loader.deactivate();
                 }
             }
             self.query = None;
@@ -293,7 +293,8 @@ impl HistoryPage {
                     .iter()
                     .position(|c| c.sequence == sequence && c.content_hash == hash)
                 {
-                    if let CardPayloadView::Image { handle: slot, .. } =
+                    if let CardPayloadView::Image { handle: slot, .. }
+                    | CardPayloadView::VideoFile { handle: slot, .. } =
                         &mut Arc::make_mut(&mut self.cards)[index].payload
                     {
                         *slot = Some(handle);
@@ -321,6 +322,9 @@ impl HistoryPage {
                     .position(|c| c.sequence == sequence && c.content_hash == hash)
                 {
                     if let CardPayloadView::Image {
+                        thumbnail_failed, ..
+                    }
+                    | CardPayloadView::VideoFile {
                         thumbnail_failed, ..
                     } = &mut Arc::make_mut(&mut self.cards)[index].payload
                     {
@@ -822,6 +826,7 @@ fn run_worker(
                                                     status_note = format!("记录保存失败：{error}");
                                                 } else {
                                                     history_page.invalidate();
+                                                    status_note = "已记录到历史".into();
                                                 }
                                             }
                                         }

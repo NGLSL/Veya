@@ -21,6 +21,12 @@ pub struct UsedInView {
 pub enum CardPayloadView {
     Text,
     Files(Vec<String>),
+    /// A file-only projection: replay and filtering retain their file semantics.
+    VideoFile {
+        path: String,
+        handle: Option<iced::widget::image::Handle>,
+        thumbnail_failed: bool,
+    },
     Image {
         handle: Option<iced::widget::image::Handle>,
         thumbnail_failed: bool,

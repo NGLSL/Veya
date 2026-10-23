@@ -1274,14 +1274,10 @@ impl App {
     fn sidebar(&self) -> Element<'_, Message> {
         let logo = row![
             container(iced::widget::image(logo_handle()).width(30).height(30),).padding(0),
-            column![
-                text("Veya")
-                    .size(19)
-                    .color(theme::INK)
-                    .font(crate::font::name_font()),
-                meta("你的剪贴板，有记忆。").size(11).color(theme::MUTED),
-            ]
-            .spacing(1),
+            text("Veya")
+                .size(19)
+                .color(theme::INK)
+                .font(crate::font::name_font()),
         ]
         .spacing(11)
         .align_y(Alignment::Center);
@@ -1663,6 +1659,7 @@ fn short_app(exe: &str) -> String {
 fn detail_title(card: &CardView) -> String {
     match &card.payload {
         CardPayloadView::Files(paths) => return format!("文件列表 · {} 项", paths.len()),
+        CardPayloadView::VideoFile { .. } => return card.content_preview.clone(),
         CardPayloadView::Image { .. } => return "剪贴板图片".to_string(),
         CardPayloadView::Text => {}
     }
@@ -1731,6 +1728,7 @@ fn detail_subtitle(card: &CardView) -> String {
                 card.time_full
             );
         }
+        CardPayloadView::VideoFile { .. } => return format!("视频文件 · {}", card.time_full),
         CardPayloadView::Image { width, height, .. } => {
             return format!("{width} × {height} px · {}", card.time_full);
         }
