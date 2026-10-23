@@ -8,6 +8,7 @@ lists, and DIB images, plus observed application context around later paste shor
 - Product scope and current limitations: [README.md](README.md)
 - Data flow and ownership: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Build, test, and Windows runtime checks: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+- Release preparation and publication: [release workflow](docs/DEVELOPMENT.md#发布流程). Keep local work to necessary source checks; build installers, verify their lifecycle, and upload release assets in GitHub Actions.
 - Local issue workflow: [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md)
 - Issue triage roles: [docs/agents/triage-labels.md](docs/agents/triage-labels.md)
 - Domain terminology and ADR discovery: [docs/agents/domain.md](docs/agents/domain.md)

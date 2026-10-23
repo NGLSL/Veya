@@ -36,7 +36,7 @@ cargo build -p veya-desktop
 
 仓库的 `.github/workflows/ci.yml` 在 `windows-2022` 上安装 Rust 1.99.0 MSVC 工具链和 `rustfmt`，依次执行格式检查、workspace 测试、workspace 检查和 NSIS 安装包构建；构建脚本执行 release 编译及 Windows GUI 子系统检查，避免启动时出现控制台窗口。随后用真实安装器检查安装、覆盖升级和卸载。测试步骤把 `APPDATA` 指向 GitHub Actions 的临时目录；workflow 不依赖开发机缓存、用户数据库或真实剪贴板。
 
-本地安装包使用 NSIS。安装 NSIS 后执行 `./scripts/build-installer.ps1`，产物位于 `artifacts/veya-setup.exe`。组件页默认勾选开始菜单和桌面快捷方式；快捷方式使用随安装包部署、以图标内容摘要命名的独立 ICO，避免同一路径下 Explorer 沿用旧图标缓存。安装完成页提供启动 Veya 的选项；卸载会移除快捷方式、图标和程序文件。安装器就地覆盖旧版 `veya.exe`，保留用户历史和设置；卸载也不清理 `%APPDATA%\Veya`。实际安装、覆盖升级和卸载仍要用隔离数据目录及 Windows 虚拟机或测试机手动验收。
+正式 NSIS 安装包由 GitHub Actions 调用 `scripts/build-installer.ps1` 生成，产物位于 runner 的 `artifacts/veya-setup.exe`。本机负责必要的源码检查，以及涉及交互改动时的隔离运行验收；发布分工见下文[发布流程](#发布流程)。组件页默认勾选开始菜单和桌面快捷方式；快捷方式使用随安装包部署、以图标内容摘要命名的独立 ICO，避免同一路径下 Explorer 沿用旧图标缓存。安装完成页提供启动 Veya 的选项；卸载会移除快捷方式、图标和程序文件。安装器就地覆盖旧版 `veya.exe`，保留用户历史和设置；卸载也不清理 `%APPDATA%\Veya`。安装、覆盖升级、卸载及数据保留由云端的一次性 runner 验证；安装完成页等桌面交互按改动范围在隔离 Windows 环境中人工验收。
 
 `scripts/test-installer.ps1` 只允许全新、具有管理员权限的 GitHub Actions runner，拒绝已有 Veya 进程、注册项或快捷方式。在 `RUNNER_TEMP` 的唯一路径校验官方 v0.2.1 安装包及 SHA-256，安装后同路径升级至当前构建，核对已安装 exe 与 release binary 哈希、版本、注册信息、链接和图标；最后卸载并检查其清理及隔离 SQLite／文件数据未变。CI 与 Release 都执行此门禁。它验证安装器的文件／系统行为，不启动 GUI，不代替桌面交互、安装完成页普通权限启动等手动检查；不要在日常主机通过伪造环境变量绕过运行边界。
 
@@ -113,10 +113,23 @@ finally {
 
 ## 发布流程
 
-1. 更新 workspace 版本，在 `docs/releases/vX.Y.Z.md` 写人工发布说明，覆盖变化、升级影响、验证和已知限制。
-2. 将候选提交推到 GitHub 默认分支，等待该提交的 `CI` push run 成功；确认 Windows 安装、覆盖升级及卸载的实际验收结果。
-3. 在同一提交创建并推送注释标签 `vX.Y.Z`。`release.yml` 检查标签格式、Cargo 版本、发布说明、默认分支包含关系和该提交的成功 CI 后，重新运行测试、构建 NSIS 安装包、生成 SHA-256 并发布 GitHub Release。
-4. 发布后下载安装包，独立复算 SHA-256，并核对发布页和安装行为。仓库首次推送与实际发布属于单独操作，配置文件本身不会触发发布。
+本机只做必要的源码检查和版本准备。正式 release 编译、Windows GUI 子系统检查、NSIS 打包、安装／覆盖升级／卸载及数据保留验证，以及 Release 资产上传，统一在 GitHub Actions 的 Windows runner 上完成。本机发布准备无需安装 NSIS，也不额外构建安装包或运行安装器验证脚本。
+
+1. 在 `dev` 准备候选：更新根 `Cargo.toml` 的 workspace 版本，同步 `Cargo.lock` 中的 Veya 包版本，并在 `docs/releases/vX.Y.Z.md` 写人工发布说明，覆盖变化、升级影响、验证和已知限制。
+2. 本机按[改动范围](#按改动选择验证)完成必要检查。涉及程序源码的发布候选通常执行下方三个命令；已通过且相关文件未再变化的检查复用结果。文档或流程改动按验证表检查命令、路径及配置即可。
+
+   ```powershell
+   cargo fmt --all -- --check
+   cargo check --locked --workspace
+   cargo test --locked --workspace
+   ```
+
+   涉及真实 Windows 交互的改动，另按上文在隔离 `APPDATA` 下运行开发构建验收；这类交互结果与云端安装器验证分别记录。
+3. 在已获授权的范围内提交并推送 `dev`，将同一候选提交快进到 `main` 并推送。等待该精确 SHA 在 `main` 上的 `CI` push run 成功，核对云端安装、覆盖升级、卸载及数据保留结果。
+4. 在同一提交创建并推送注释标签 `vX.Y.Z`。`release.yml` 检查标签格式、Cargo 版本、发布说明、默认分支包含关系和该提交的成功 CI 后，在云端重新运行测试、构建安装包、验证安装／覆盖升级／卸载及数据保留、生成 SHA-256，再将本次 runner 生成的安装包和摘要上传到 GitHub Release。
+5. 等待 Release workflow 成功，核对发布版本、提交和公开资产。下载公开安装包及 `.sha256`，独立复算 SHA-256，并与摘要文件和 GitHub 资产摘要比对；该步骤只核对下载产物。交付时分别说明本机检查、云端 CI／Release 和按需的人工交互验收结果。
+
+配置或文档提交本身不会发布版本；正式发布仍由上述版本标签触发。
 
 如果标签已推送而 Release workflow 在创建 Release 前失败，先修复工作流并提交到默认分支，再在 GitHub Actions 手动运行 `Release`，传入原有的 `vX.Y.Z` 标签。也可执行 `gh workflow run release.yml --repo NGLSL/Veya --ref main -f tag=vX.Y.Z`。重试仍检验该注释标签的版本、默认分支包含关系和标签提交的成功 CI；不要移动已发布的标签。
 

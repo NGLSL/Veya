@@ -59,7 +59,7 @@ cargo check --workspace
 cargo run -p veya-desktop
 ```
 
-构建安装包还需要 NSIS，命令和 Windows 手动验收步骤见 [开发文档](docs/DEVELOPMENT.md)。
+正式安装包由 GitHub Actions 构建、验证并发布，本机开发和发布准备无需安装 NSIS。必要检查、发布流程和 Windows 手动验收步骤见 [开发文档](docs/DEVELOPMENT.md)。
 
 ## 项目结构
 
