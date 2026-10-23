@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 publish = false
 
@@ -34,5 +34,6 @@ windows = { version = "0.61", features = [
 opt-level = 1
 
 [patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
 iced_winit = { path = "vendor/iced_winit" }
 iced_tiny_skia = { path = "vendor/iced_tiny_skia" }

@@ -2,13 +2,15 @@
 //!
 //! Raw events are never merged. Aggregation is a read-model concern (veya-core).
 
-use std::{collections::HashMap, fmt::Write as _, path::Path};
+use std::{borrow::Cow, collections::HashMap, fmt::Write as _, path::Path};
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use veya_core::{
     ClipboardPayload, ClipboardRecord, HistoryPayload, HistoryRecord, PasteMethod,
     PasteTriggerRecord, SourceConfidence,
 };
+
+const HISTORY_READ_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Persisted list image, bounded to the UI thumbnail edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +179,7 @@ impl Store {
             params![
                 rec.sequence as i64,
                 rec.payload.kind(),
-                rec.payload.display_text(),
+                rec.payload.display_text().as_ref(),
                 rec.content_hash,
                 rec.source_app,
                 rec.source_pid as i64,
@@ -185,7 +187,7 @@ impl Store {
                 rec.source_confidence.as_str(),
                 rec.created_at_ms,
                 rec.pinned as i64,
-                blob,
+                blob.as_deref(),
                 width,
                 height,
             ],
@@ -312,6 +314,8 @@ impl Store {
 
     /// Load searchable history metadata without transferring original image BLOBs.
     /// Full text is owned once and can be discarded after matching/preview creation.
+    /// Batches stop at the byte budget or record limit. A single oversized record
+    /// is still returned so callers can advance; only an empty batch means EOF.
     pub fn load_history_page(
         &self,
         cursor: Option<(i64, u32)>,
@@ -336,16 +340,31 @@ impl Store {
         "#
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut records = stmt
-            .query_map(
-                params![
-                    cursor.map(|c| c.0),
-                    cursor.map(|c| i64::from(c.1)),
-                    i64::try_from(limit).unwrap_or(i64::MAX)
-                ],
-                decode_history_record,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut records = Vec::new();
+        let mut bytes = 0usize;
+        let mut rows = stmt.query(params![
+            cursor.map(|c| c.0),
+            cursor.map(|c| i64::from(c.1)),
+            i64::try_from(limit).unwrap_or(i64::MAX)
+        ])?;
+        while let Some(row) = rows.next()? {
+            let content_bytes = row.get_ref(2)?.as_str()?.len();
+            let file_bytes = match row.get_ref(10)? {
+                rusqlite::types::ValueRef::Blob(blob) => blob.len(),
+                _ => 0,
+            };
+            let record_bytes = content_bytes.saturating_add(file_bytes);
+            if !records.is_empty() && bytes.saturating_add(record_bytes) > HISTORY_READ_BYTE_BUDGET
+            {
+                break;
+            }
+            records.push(decode_history_record(row)?);
+            bytes = bytes.saturating_add(record_bytes);
+            if bytes >= HISTORY_READ_BYTE_BUDGET {
+                break;
+            }
+        }
+        drop(rows);
         drop(stmt);
         let sequences: Vec<u32> = records.iter().map(|r| r.sequence).collect();
         let mut pastes = self.load_pastes(&sequences)?;
@@ -705,7 +724,7 @@ fn decode_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRec
         "text" => HistoryPayload::Text,
         "files" => {
             let decoded = decode_payload("files", &content, row.get(10)?, None, None)?;
-            content = decoded.display_text();
+            content = decoded.display_text().to_string();
             let ClipboardPayload::Files(paths) = decoded else {
                 unreachable!()
             };
@@ -766,14 +785,14 @@ fn has_column(conn: &Connection, table: &str, name: &str) -> rusqlite::Result<bo
 
 fn encode_payload(
     payload: &ClipboardPayload,
-) -> rusqlite::Result<(Option<Vec<u8>>, Option<i64>, Option<i64>)> {
+) -> rusqlite::Result<(Option<Cow<'_, [u8]>>, Option<i64>, Option<i64>)> {
     match payload {
         ClipboardPayload::Text(_) => Ok((None, None, None)),
         ClipboardPayload::Files(paths) => serde_json::to_vec(paths)
-            .map(|bytes| (Some(bytes), None, None))
+            .map(|bytes| (Some(Cow::Owned(bytes)), None, None))
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error))),
         ClipboardPayload::Image { png, width, height } => Ok((
-            Some(png.clone()),
+            Some(Cow::Borrowed(png.as_slice())),
             Some(i64::from(*width)),
             Some(i64::from(*height)),
         )),
@@ -799,7 +818,7 @@ fn decode_payload(
     height: Option<i64>,
 ) -> rusqlite::Result<ClipboardPayload> {
     match kind {
-        "text" => Ok(ClipboardPayload::Text(content.to_string())),
+        "text" => Ok(ClipboardPayload::Text(content.into())),
         "files" => {
             let bytes = blob.ok_or_else(|| invalid_payload("missing file-list payload"))?;
             let paths: Vec<String> = serde_json::from_slice(&bytes).map_err(|error| {
@@ -817,9 +836,11 @@ fn decode_payload(
                 .and_then(|n| u32::try_from(n).ok())
                 .filter(|n| *n > 0);
             match (width, height) {
-                (Some(width), Some(height)) if !png.is_empty() => {
-                    Ok(ClipboardPayload::Image { png, width, height })
-                }
+                (Some(width), Some(height)) if !png.is_empty() => Ok(ClipboardPayload::Image {
+                    png: png.into(),
+                    width,
+                    height,
+                }),
                 _ => Err(invalid_payload("invalid image payload")),
             }
         }
@@ -856,8 +877,8 @@ mod tests {
         ClipboardRecord {
             sequence: seq,
             content_type: "text".into(),
-            content: format!("text-{seq}"),
-            payload: ClipboardPayload::Text(format!("text-{seq}")),
+            content: format!("text-{seq}").into(),
+            payload: ClipboardPayload::Text(format!("text-{seq}").into()),
             content_hash: format!("h{seq}"),
             source_app: "chrome.exe".into(),
             source_pid: 1,
@@ -888,7 +909,7 @@ mod tests {
         ));
         let mut image = rec(1);
         image.payload = ClipboardPayload::Image {
-            png: vec![7; 1024 * 1024],
+            png: vec![7; 1024 * 1024].into(),
             width: 1024,
             height: 1024,
         };
@@ -943,7 +964,8 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let mut text = rec(1);
         text.created_at_ms = 100;
-        text.payload = ClipboardPayload::Text(format!("{}OUTSIDE_PREVIEW", "long ".repeat(2000)));
+        text.payload =
+            ClipboardPayload::Text(format!("{}OUTSIDE_PREVIEW", "long ".repeat(2000)).into());
         text.pinned = true;
         text.source_confidence = SourceConfidence::Likely;
         let mut files = rec(2);
@@ -952,7 +974,7 @@ mod tests {
         let mut image = rec(3);
         image.created_at_ms = 200;
         image.payload = ClipboardPayload::Image {
-            png: vec![7; 1024 * 1024],
+            png: vec![7; 1024 * 1024].into(),
             width: 2048,
             height: 2048,
         };
@@ -963,7 +985,7 @@ mod tests {
         let projected = store.load_history_page(None, 10, false).unwrap();
         for (raw, p) in raw.iter().zip(&projected) {
             assert_eq!(p.sequence, raw.sequence);
-            assert_eq!(p.content, raw.content);
+            assert_eq!(p.content, raw.content.as_ref());
             assert_eq!(p.content_hash, raw.content_hash);
             assert_eq!(p.source_app, raw.source_app);
             assert_eq!(p.source_window, raw.source_window);
@@ -1009,7 +1031,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let mut image = rec(1);
         image.payload = ClipboardPayload::Image {
-            png: vec![1, 2, 3],
+            png: vec![1, 2, 3].into(),
             width: 2048,
             height: 2048,
         };
@@ -1079,7 +1101,7 @@ mod tests {
         ));
         let mut image = rec(1);
         image.payload = ClipboardPayload::Image {
-            png: vec![1, 2, 3],
+            png: vec![1, 2, 3].into(),
             width: 100,
             height: 100,
         };
@@ -1112,7 +1134,7 @@ mod tests {
         files.payload = ClipboardPayload::Files(vec![r"C:\临时\real.txt".into()]);
         let mut image = rec(2);
         image.payload = ClipboardPayload::Image {
-            png: vec![1, 2, 3],
+            png: vec![1, 2, 3].into(),
             width: 2048,
             height: 1024,
         };
@@ -1129,7 +1151,7 @@ mod tests {
         for sequence in [1, 2] {
             let raw = store.load_record(sequence).unwrap().unwrap();
             let content = store.load_content(sequence).unwrap().unwrap();
-            assert_eq!(content, raw.content);
+            assert_eq!(content, raw.content.as_ref());
             assert_ne!(content, "old inconsistent label");
         }
     }
@@ -1139,7 +1161,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let mut image = rec(1);
         image.payload = ClipboardPayload::Image {
-            png: vec![1, 2, 3],
+            png: vec![1, 2, 3].into(),
             width: 128,
             height: 128,
         };
@@ -1194,7 +1216,7 @@ mod tests {
         store.insert_record(&rec(1)).unwrap();
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].content, "text-1");
+        assert_eq!(loaded[0].content.as_ref(), "text-1");
         assert_eq!(loaded[0].pastes.len(), 1);
         assert_eq!(loaded[0].pastes[0].target_app, "notepad.exe");
         assert_eq!(loaded[0].source_confidence, SourceConfidence::Exact);
@@ -1365,7 +1387,7 @@ mod tests {
         let mut image = rec(1);
         image.created_at_ms = 100;
         image.payload = ClipboardPayload::Image {
-            png: vec![137, 80, 78, 71, 1, 2, 3],
+            png: vec![137, 80, 78, 71, 1, 2, 3].into(),
             width: 320,
             height: 240,
         };
@@ -1383,7 +1405,7 @@ mod tests {
         assert_eq!(
             page[0].payload,
             ClipboardPayload::Image {
-                png: vec![137, 80, 78, 71, 1, 2, 3],
+                png: vec![137, 80, 78, 71, 1, 2, 3].into(),
                 width: 320,
                 height: 240,
             }
@@ -1430,7 +1452,7 @@ mod tests {
         store.migrate().unwrap();
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].content, "legacy text");
+        assert_eq!(loaded[0].content.as_ref(), "legacy text");
         assert!(!loaded[0].pinned);
         let projection = store.load_history_page(None, 25, true).unwrap();
         assert_eq!(projection[0].content, "legacy text");
@@ -1446,7 +1468,7 @@ mod tests {
             ClipboardPayload::Files(vec![r"C:\临时\a.txt".into(), r"C:\临时\folder".into()]);
         let mut image = rec(2);
         image.payload = ClipboardPayload::Image {
-            png: vec![137, 80, 78, 71],
+            png: vec![137, 80, 78, 71].into(),
             width: 320,
             height: 240,
         };

@@ -722,6 +722,10 @@ async fn run_instance<P, C>(
 
                 if make_visible {
                     window.raw.set_visible(true);
+                    window.raw.request_redraw();
+                }
+                if window.graphics_are_suspended() {
+                    window.release_graphics(&compositor);
                 }
 
                 events.push((
@@ -785,6 +789,18 @@ async fn run_instance<P, C>(
                         else {
                             continue;
                         };
+
+                        let physical_size = window.state.physical_size();
+                        if window.graphics_are_suspended()
+                            || physical_size.width == 0
+                            || physical_size.height == 0
+                        {
+                            window.release_graphics(&compositor);
+                            let _ = control_sender.start_send(
+                                Control::ChangeFlow(ControlFlow::Wait),
+                            );
+                            continue;
+                        }
 
                         // TODO: Avoid redrawing all the time by forcing widgets to
                         // request redraws on state changes
@@ -903,20 +919,28 @@ async fn run_instance<P, C>(
                                     new_mouse_interaction;
                             }
 
-                            compositor.configure_surface(
-                                &mut window.surface,
-                                physical_size.width,
-                                physical_size.height,
-                            );
+                            if let Some(surface) = &mut window.surface {
+                                compositor.configure_surface(
+                                    surface,
+                                    physical_size.width,
+                                    physical_size.height,
+                                );
+                            }
 
                             window.viewport_version =
                                 window.state.viewport_version();
                         }
 
+                        if !window.ensure_surface(&mut compositor) {
+                            continue;
+                        }
                         debug.render_started();
                         match compositor.present(
                             &mut window.renderer,
-                            &mut window.surface,
+                            window
+                                .surface
+                                .as_mut()
+                                .expect("Configured surface"),
                             window.state.viewport(),
                             window.state.background_color(),
                             &debug.overlay(),
@@ -1000,6 +1024,10 @@ async fn run_instance<P, C>(
                                 &mut debug,
                             );
 
+                            if window.graphics_are_suspended() {
+                                window.release_graphics(&compositor);
+                            }
+
                             if let Some(event) = conversion::window_event(
                                 window_event,
                                 window.state.scale_factor(),
@@ -1051,6 +1079,10 @@ async fn run_instance<P, C>(
                                     ui_state,
                                     user_interface::State::Outdated
                                 );
+                            }
+
+                            if window.graphics_are_suspended() {
+                                window.release_graphics(&compositor);
                             }
 
                             for (event, status) in window_events
@@ -1111,6 +1143,7 @@ async fn run_instance<P, C>(
                                     &mut debug,
                                     &mut window_manager,
                                     cached_interfaces,
+                                    &compositor,
                                 ));
 
                             if actions > 0 {
@@ -1302,6 +1335,11 @@ fn run_action<P, C>(
             window::Action::Minimize(id, minimized) => {
                 if let Some(window) = window_manager.get_mut(id) {
                     window.raw.set_minimized(minimized);
+                    if minimized || window.graphics_are_suspended() {
+                        window.release_graphics(compositor);
+                    } else {
+                        window.raw.request_redraw();
+                    }
                 }
             }
             window::Action::GetPosition(id, channel) => {
@@ -1344,6 +1382,13 @@ fn run_action<P, C>(
                         window.raw.current_monitor(),
                         mode,
                     ));
+                    if mode == core::window::Mode::Hidden
+                        || window.graphics_are_suspended()
+                    {
+                        window.release_graphics(compositor);
+                    } else {
+                        window.raw.request_redraw();
+                    }
                 }
             }
             window::Action::ChangeIcon(id, icon) => {
@@ -1422,13 +1467,37 @@ fn run_action<P, C>(
             }
             window::Action::Screenshot(id, channel) => {
                 if let Some(window) = window_manager.get_mut(id) {
+                    if !window.ensure_surface(compositor) {
+                        // A zero-sized viewport has no screenshot. Dropping the
+                        // response cancels the request without allocating pixels.
+                        window.release_graphics(compositor);
+                        return;
+                    }
+                    if let Some(ui) = interfaces.remove(&id) {
+                        let mut ui = ui.relayout(
+                            window.state.logical_size(),
+                            &mut window.renderer,
+                        );
+                        let _ = ui.draw(
+                            &mut window.renderer,
+                            window.state.theme(),
+                            &renderer::Style {
+                                text_color: window.state.text_color(),
+                            },
+                            window.state.cursor(),
+                        );
+                        let _ = interfaces.insert(id, ui);
+                    }
                     let bytes = compositor.screenshot(
                         &mut window.renderer,
-                        &mut window.surface,
+                        window.surface.as_mut().expect("Configured surface"),
                         window.state.viewport(),
                         window.state.background_color(),
                         &debug.overlay(),
                     );
+                    if window.graphics_are_suspended() {
+                        window.release_graphics(compositor);
+                    }
 
                     let _ = channel.send(window::Screenshot::new(
                         bytes,
@@ -1470,6 +1539,9 @@ fn run_action<P, C>(
                 for (id, ui) in interfaces.iter_mut() {
                     if let Some(window) = window_manager.get_mut(*id) {
                         ui.operate(&window.renderer, operation.as_mut());
+                        if window.graphics_are_suspended() {
+                            window.release_graphics(compositor);
+                        }
                     }
                 }
 
@@ -1502,6 +1574,7 @@ pub fn build_user_interfaces<'a, P: Program, C>(
     debug: &mut Debug,
     window_manager: &mut WindowManager<P, C>,
     mut cached_user_interfaces: FxHashMap<window::Id, user_interface::Cache>,
+    compositor: &C,
 ) -> FxHashMap<window::Id, UserInterface<'a, P::Message, P::Theme, P::Renderer>>
 where
     C: Compositor<Renderer = P::Renderer>,
@@ -1512,17 +1585,20 @@ where
         .filter_map(|(id, cache)| {
             let window = window_manager.get_mut(id)?;
 
-            Some((
+            let ui = build_user_interface(
+                program,
+                cache,
+                &mut window.renderer,
+                window.state.logical_size(),
+                debug,
                 id,
-                build_user_interface(
-                    program,
-                    cache,
-                    &mut window.renderer,
-                    window.state.logical_size(),
-                    debug,
-                    id,
-                ),
-            ))
+            );
+            // Layout can populate image dimensions and text caches even when
+            // no pixels are drawn. Keep its widget state, release backend data.
+            if window.graphics_are_suspended() {
+                window.release_graphics(compositor);
+            }
+            Some((id, ui))
         })
         .collect()
 }

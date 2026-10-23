@@ -1,15 +1,19 @@
 //! Stored flow records. Raw events stay separate; UI aggregation is a view.
 
+use std::sync::Arc;
+
 use crate::events::{PasteConfidence, PasteMethod, SourceConfidence};
 
 /// The actual clipboard payload retained for replay. A path-like text string
 /// stays Text; Files is reserved for a real file-list clipboard format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardPayload {
-    Text(String),
+    /// Shared with the raw record's searchable projection and loaded details.
+    Text(Arc<str>),
     Files(Vec<String>),
     Image {
-        png: Vec<u8>,
+        /// Sharing preserves the Vec allocation during replay and full preview.
+        png: Arc<Vec<u8>>,
         width: u32,
         height: u32,
     },
@@ -25,11 +29,11 @@ impl ClipboardPayload {
     }
 
     /// Text projection for search and history labels, never used for replay.
-    pub fn display_text(&self) -> String {
+    pub fn display_text(&self) -> Arc<str> {
         match self {
             Self::Text(text) => text.clone(),
-            Self::Files(paths) => paths.join("\n"),
-            Self::Image { width, height, .. } => format!("图片 {width} × {height}"),
+            Self::Files(paths) => paths.join("\n").into(),
+            Self::Image { width, height, .. } => format!("图片 {width} × {height}").into(),
         }
     }
 }
@@ -80,7 +84,7 @@ pub struct PasteTriggerRecord {
 pub struct ClipboardRecord {
     pub sequence: u32,
     pub content_type: String,
-    pub content: String,
+    pub content: Arc<str>,
     /// Authoritative data for replay. `content` is only a searchable projection.
     pub payload: ClipboardPayload,
     pub content_hash: String,

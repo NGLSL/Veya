@@ -42,12 +42,6 @@ where
     ) -> &mut Window<P, C> {
         let state = State::new(application, id, &window);
         let viewport_version = state.viewport_version();
-        let physical_size = state.physical_size();
-        let surface = compositor.create_surface(
-            window.clone(),
-            physical_size.width,
-            physical_size.height,
-        );
         let renderer = compositor.create_renderer();
 
         let _ = self.aliases.insert(window.id(), id);
@@ -59,7 +53,7 @@ where
                 state,
                 viewport_version,
                 exit_on_close_request,
-                surface,
+                surface: None,
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
             },
@@ -136,7 +130,7 @@ where
     pub viewport_version: u64,
     pub exit_on_close_request: bool,
     pub mouse_interaction: mouse::Interaction,
-    pub surface: C::Surface,
+    pub surface: Option<C::Surface>,
     pub renderer: P::Renderer,
 }
 
@@ -146,6 +140,41 @@ where
     C: Compositor<Renderer = P::Renderer>,
     P::Theme: DefaultStyle,
 {
+    /// Occlusion alone does not suspend a visible window.
+    pub fn graphics_are_suspended(&self) -> bool {
+        !self.raw.is_visible().unwrap_or(true)
+            || self.raw.is_minimized().unwrap_or(false)
+    }
+
+    /// Keep the native window and UI state; drop backend pixels and caches.
+    pub fn release_graphics(&mut self, compositor: &C) {
+        self.surface = None;
+        self.renderer = compositor.create_renderer();
+    }
+
+    /// Create a fresh, correctly configured surface after show/restore.
+    pub fn ensure_surface(&mut self, compositor: &mut C) -> bool {
+        let size = self.state.physical_size();
+        if size.width == 0 || size.height == 0 {
+            return false;
+        }
+        if self.surface.is_none() {
+            self.surface = Some(compositor.create_surface(
+                self.raw.clone(),
+                size.width,
+                size.height,
+            ));
+        } else if self.viewport_version != self.state.viewport_version() {
+            compositor.configure_surface(
+                self.surface.as_mut().expect("Existing surface"),
+                size.width,
+                size.height,
+            );
+        }
+        self.viewport_version = self.state.viewport_version();
+        true
+    }
+
     pub fn position(&self) -> Option<Point> {
         self.raw
             .inner_position()

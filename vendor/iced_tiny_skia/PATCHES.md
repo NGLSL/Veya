@@ -4,9 +4,15 @@ This directory contains the crates.io `iced_tiny_skia` 0.13.0 package source and
 normalized Cargo manifest. The MIT license is retained from Iced.
 Registry checksum: `c625d368284fcc43b0b36b176f76eff1abebe7959dd58bd8ce6897d641962a50`.
 
-Source modifications are limited to `src/engine.rs` and
+Source modifications are limited to `src/engine.rs`, `src/vector.rs` and
 `src/window/compositor.rs`:
 
+- SVG font discovery lazily initializes one process-wide `Arc<fontdb::Database>`
+  on the first SVG measurement. Fresh renderers share that immutable database
+  instead of rescanning system fonts after every hidden-window cache release.
+  System font discovery and SVG text support stay intact; usvg's mutable access
+  uses `Arc::make_mut`, keeping the shared original isolated from parser changes.
+  SVG trees, raster pixels, image buffers and glyph caches remain disposable.
 - Zero-width or zero-height quads are valid empty layout regions. Skip them
   before the original assertions and path construction. Quick-panel transitions
   and native minimization can temporarily leave a child with zero available

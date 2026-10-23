@@ -166,13 +166,17 @@ pub fn enrich_clipboard(raw: ClipboardChangeRaw) -> Option<ClipboardChange> {
     let (source_exe, source_window) = ("unknown".to_string(), String::new());
 
     let payload = match raw.payload {
-        ClipboardPayloadRaw::Text(text) => ClipboardPayload::Text(text),
+        ClipboardPayloadRaw::Text(text) => ClipboardPayload::Text(text.into()),
         ClipboardPayloadRaw::Files(paths) => ClipboardPayload::Files(paths),
         ClipboardPayloadRaw::Png(png) => {
             #[cfg(windows)]
             {
                 let (width, height) = clipboard::png_dimensions(&png)?;
-                ClipboardPayload::Image { png, width, height }
+                ClipboardPayload::Image {
+                    png: png.into(),
+                    width,
+                    height,
+                }
             }
             #[cfg(not(windows))]
             {
@@ -184,7 +188,11 @@ pub fn enrich_clipboard(raw: ClipboardChangeRaw) -> Option<ClipboardChange> {
             #[cfg(windows)]
             {
                 let (png, width, height) = clipboard::dib_to_png(format, &bytes)?;
-                ClipboardPayload::Image { png, width, height }
+                ClipboardPayload::Image {
+                    png: png.into(),
+                    width,
+                    height,
+                }
             }
             #[cfg(not(windows))]
             {

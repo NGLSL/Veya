@@ -276,7 +276,7 @@ mod tests {
     fn projection(record: &ClipboardRecord) -> HistoryRecord {
         HistoryRecord {
             sequence: record.sequence,
-            content: record.content.clone(),
+            content: record.content.to_string(),
             payload: match &record.payload {
                 ClipboardPayload::Text(_) => HistoryPayload::Text,
                 ClipboardPayload::Files(paths) => HistoryPayload::Files(paths.clone()),
@@ -363,7 +363,7 @@ mod tests {
         let mut image = record(7, 5_005);
         image.content_hash = "image hash".into();
         image.payload = ClipboardPayload::Image {
-            png: vec![1; 16],
+            png: vec![1; 16].into(),
             width: 2,
             height: 2,
         };

@@ -8,7 +8,7 @@ use tiny_skia::Transform;
 use std::cell::RefCell;
 use std::collections::hash_map;
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
 pub struct Pipeline {
@@ -85,10 +85,20 @@ impl Cache {
 
         // TODO: Reuse `cosmic-text` font database
         if self.fontdb.is_none() {
-            let mut fontdb = usvg::fontdb::Database::new();
-            fontdb.load_system_fonts();
-
-            self.fontdb = Some(Arc::new(fontdb));
+            // Renderer caches are disposable while a window is hidden. Reuse
+            // immutable font metadata instead of enumerating system fonts on
+            // every subsequent SVG measurement and window restore.
+            static FONTDB: OnceLock<Arc<usvg::fontdb::Database>> =
+                OnceLock::new();
+            self.fontdb = Some(
+                FONTDB
+                    .get_or_init(|| {
+                        let mut fontdb = usvg::fontdb::Database::new();
+                        fontdb.load_system_fonts();
+                        Arc::new(fontdb)
+                    })
+                    .clone(),
+            );
         }
 
         let options = usvg::Options {

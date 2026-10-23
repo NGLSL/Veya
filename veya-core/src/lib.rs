@@ -22,4 +22,4 @@ pub use events::{
 };
 pub use flow::{FlowEngine, FlowOutcome};
 pub use model::{payload_hash, ClipboardPayload, ClipboardRecord, PasteTriggerRecord};
-pub use search::{match_field, MatchField, SearchHit};
+pub use search::{match_field, MatchField, PreparedSearch, SearchHit};

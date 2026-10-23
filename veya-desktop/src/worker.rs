@@ -114,6 +114,15 @@ fn load_replay_record(
         .ok_or_else(|| "记录已不存在".into())
 }
 
+/// Let Iced own a shared PNG without copying the original Vec allocation.
+struct SharedImageBytes(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedImageBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 fn recopy_plain_text(
     flow: &mut FlowEngine,
     store: &Store,
@@ -124,7 +133,7 @@ fn recopy_plain_text(
         .load_content(sequence)
         .map_err(|error| format!("读取记录失败：{error}"))?
         .ok_or_else(|| "记录已不存在".to_string())?;
-    write_internal_payload(flow, &ClipboardPayload::Text(text), writer)
+    write_internal_payload(flow, &ClipboardPayload::Text(text.into()), writer)
 }
 
 fn prepare_record_paste(
@@ -572,9 +581,15 @@ fn run_worker(
                         history_page.detail_content = None;
                         history_page.detail_error = None;
                         if history_active {
-                            match store.load_content(sequence) {
+                            let content = match flow.record(sequence) {
+                                Some(record) => Ok(Some(record.payload.display_text())),
+                                None => {
+                                    store.load_content(sequence).map(|text| text.map(Arc::from))
+                                }
+                            };
+                            match content {
                                 Ok(Some(text)) => {
-                                    history_page.detail_content = Some((sequence, Arc::from(text)))
+                                    history_page.detail_content = Some((sequence, text))
                                 }
                                 Ok(None) => {
                                     history_page.detail_error =
@@ -708,15 +723,23 @@ fn run_worker(
                         if !history_active {
                             continue;
                         }
+                        if modal_image
+                            .as_ref()
+                            .is_some_and(|(loaded, _)| *loaded == sequence)
+                        {
+                            continue;
+                        }
                         modal_image =
-                            store
-                                .load_record(sequence)
+                            load_replay_record(&flow, &store, sequence)
                                 .ok()
-                                .flatten()
                                 .and_then(|record| match record.payload {
                                     ClipboardPayload::Image { png, .. } => Some((
                                         sequence,
-                                        iced::widget::image::Handle::from_bytes(png),
+                                        iced::widget::image::Handle::from_bytes(
+                                            iced_graphics::core::image::Bytes::from_owner(
+                                                SharedImageBytes(png),
+                                            ),
+                                        ),
                                     )),
                                     _ => None,
                                 });
@@ -899,7 +922,7 @@ mod tests {
     };
 
     pub(super) fn text_record(sequence: u32, text: &str, created_at_ms: i64) -> ClipboardRecord {
-        let payload = ClipboardPayload::Text(text.to_string());
+        let payload = ClipboardPayload::Text(text.into());
         ClipboardRecord {
             sequence,
             content_type: "text".into(),
@@ -1012,7 +1035,7 @@ mod tests {
         let mut flow = FlowEngine::new();
         assert_eq!(
             recopy_plain_text(&mut flow, &store, 7, |payload| {
-                assert_eq!(payload, &ClipboardPayload::Text(full.clone()));
+                assert_eq!(payload, &ClipboardPayload::Text(full.clone().into()));
                 Ok(42)
             }),
             Ok(42)
@@ -1029,7 +1052,7 @@ mod tests {
             ClipboardPayload::Text("original text".into()),
             ClipboardPayload::Files(vec![r"C:\Pictures\one.png".into(), r"C:\two.txt".into()]),
             ClipboardPayload::Image {
-                png: vec![137, 80, 78, 71],
+                png: vec![137, 80, 78, 71].into(),
                 width: 3,
                 height: 2,
             },
@@ -1107,7 +1130,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let mut record = text_record(7, "invalid persisted image", 10_000);
         record.payload = ClipboardPayload::Image {
-            png: Vec::new(),
+            png: Vec::new().into(),
             width: 1,
             height: 1,
         };
@@ -1346,7 +1369,7 @@ mod tests {
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
         image.payload = ClipboardPayload::Image {
-            png,
+            png: png.into(),
             width: 1,
             height: 1,
         };
@@ -1422,11 +1445,11 @@ mod tests {
         let mut flow = FlowEngine::new();
         let text = "copied from Veya";
 
-        let payload = ClipboardPayload::Text(text.to_string());
+        let payload = ClipboardPayload::Text(text.into());
         assert!(write_internal_payload(&mut flow, &payload, |_| Ok(41)).is_ok());
         let outcome = flow.on_clipboard_change(ClipboardChange {
             sequence: 41,
-            payload: veya_core::ClipboardPayload::Text(text.to_string()),
+            payload: veya_core::ClipboardPayload::Text(text.into()),
             content_hash: payload_hash(&payload),
             source_pid: std::process::id(),
             source_exe: "veya.exe".to_string(),
@@ -1447,14 +1470,14 @@ mod tests {
         let mut flow = FlowEngine::new();
         let text = "copy that failed";
 
-        let payload = ClipboardPayload::Text(text.to_string());
+        let payload = ClipboardPayload::Text(text.into());
         assert!(write_internal_payload(&mut flow, &payload, |_| Err(
             "clipboard unavailable".into()
         ))
         .is_err());
         let outcome = flow.on_clipboard_change(ClipboardChange {
             sequence: 50,
-            payload: veya_core::ClipboardPayload::Text(text.to_string()),
+            payload: veya_core::ClipboardPayload::Text(text.into()),
             content_hash: payload_hash(&payload),
             source_pid: 200,
             source_exe: "Code.exe".to_string(),

@@ -464,18 +464,22 @@ fn decode_thumbnail(bytes: &[u8], current: &impl Fn() -> bool) -> Option<Thumbna
         rgba,
     })
 }
-fn matches(summary: &HistorySummary, query: &HistoryQuery) -> bool {
+fn matches(
+    summary: &HistorySummary,
+    query: &HistoryQuery,
+    search: &veya_core::PreparedSearch,
+) -> bool {
     let record = &summary.representative;
     let kind = format::history_kind(&record.payload, &record.content);
     query.filter.matches(kind)
         && (!query.pinned_only || record.pinned)
-        && veya_core::match_field(
-            &record.content,
-            &record.source_app,
-            summary.used_in.iter().map(|u| u.target_app.as_str()),
-            &query.search,
-        )
-        .is_some()
+        && search
+            .match_field(
+                &record.content,
+                &record.source_app,
+                summary.used_in.iter().map(|u| u.target_app.as_str()),
+            )
+            .is_some()
 }
 pub(super) fn load_page(
     store: &Store,
@@ -487,8 +491,9 @@ pub(super) fn load_page(
     let mut cards = Vec::with_capacity(HISTORY_PAGE_SIZE);
     let mut matched = 0usize;
     let skip = query.page.saturating_mul(HISTORY_PAGE_SIZE);
+    let search = veya_core::PreparedSearch::new(&query.search);
     let mut consume = |summary: HistorySummary| {
-        if matches(&summary, query) {
+        if matches(&summary, query, &search) {
             if matched >= skip.saturating_add(HISTORY_PAGE_SIZE) {
                 return true;
             }
@@ -518,7 +523,7 @@ pub(super) fn load_page(
                 }
             }
         }
-        if count < HISTORY_READ_BATCH {
+        if count == 0 {
             break;
         }
     }
@@ -643,7 +648,7 @@ mod tests {
         let mut store = Store::open(&db.0).unwrap();
         let mut record = text_record(1, "", 10_000);
         record.payload = ClipboardPayload::Image {
-            png: b"invalid PNG".to_vec(),
+            png: b"invalid PNG".to_vec().into(),
             width: 10,
             height: 10,
         };
@@ -687,7 +692,7 @@ mod tests {
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
         record.payload = ClipboardPayload::Image {
-            png,
+            png: png.into(),
             width: 256,
             height: 256,
         };

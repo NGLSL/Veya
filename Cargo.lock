@@ -633,8 +633,6 @@ dependencies = [
 [[package]]
 name = "cosmic-text"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59fd57d82eb4bfe7ffa9b1cec0c05e2fd378155b47f255a67983cb4afe0e80c2"
 dependencies = [
  "bitflags 2.13.2",
  "fontdb 0.16.2",
@@ -3843,11 +3841,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veya-core"
-version = "0.2.6"
+version = "0.2.7"
 
 [[package]]
 name = "veya-desktop"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "iced",
  "iced_graphics",
@@ -3865,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "veya-storage"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -3874,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "veya-windows"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "image 0.25.10",
  "serde_json",

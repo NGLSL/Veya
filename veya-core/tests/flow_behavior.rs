@@ -8,7 +8,7 @@ use veya_core::{
 fn change(sequence: u32, text: &str, hash: &str, source_exe: &str, t: i64) -> ClipboardChange {
     ClipboardChange {
         sequence,
-        payload: ClipboardPayload::Text(text.to_string()),
+        payload: ClipboardPayload::Text(text.into()),
         content_hash: hash.to_string(),
         source_pid: 1000 + sequence,
         source_exe: source_exe.to_string(),
@@ -41,7 +41,7 @@ fn clipboard_change_creates_visible_record() {
     let outcome = flow.on_clipboard_change(change(1, "hello", "h1", "chrome.exe", 1_000));
     assert_eq!(outcome, FlowOutcome::Recorded { sequence: 1 });
     let rec = flow.record(1).expect("record 1");
-    assert_eq!(rec.content, "hello");
+    assert_eq!(rec.content.as_ref(), "hello");
     assert_eq!(rec.source_app, "chrome.exe");
     assert_eq!(rec.source_confidence, SourceConfidence::Exact);
     assert!(!rec.has_paste_activity());
@@ -81,7 +81,7 @@ fn copy_a_and_copy_b_do_not_cross_link() {
     flow.on_paste_trigger(paste("notepad.exe", 3_000));
     assert_eq!(flow.record(1).unwrap().pastes.len(), 0);
     assert_eq!(flow.record(2).unwrap().pastes.len(), 1);
-    assert_eq!(flow.record(2).unwrap().content, "BBB");
+    assert_eq!(flow.record(2).unwrap().content.as_ref(), "BBB");
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn failed_changed_image_write_suppresses_reencoded_update_only_once() {
     let mut rewritten = change(9, "", "png-after-replay", "veya.exe", 5_000);
     rewritten.source_pid = 1234;
     rewritten.payload = ClipboardPayload::Image {
-        png: vec![1, 2, 3],
+        png: vec![1, 2, 3].into(),
         width: 1,
         height: 1,
     };
@@ -526,7 +526,7 @@ fn delete_record_removes_dependent_paste_triggers() {
     assert!(flow.delete_record(1));
     assert!(flow.record(1).is_none());
     assert_eq!(flow.len(), 1);
-    assert_eq!(flow.record(2).unwrap().content, "keep");
+    assert_eq!(flow.record(2).unwrap().content.as_ref(), "keep");
     // Deleted record's triggers are gone with it (no dangling paste views).
     assert!(flow.search("notepad").is_empty());
 }
@@ -558,7 +558,7 @@ fn file_then_image_paste_is_attached_to_image_only() {
     flow.on_clipboard_change(first);
 
     let image = ClipboardPayload::Image {
-        png: vec![1, 2, 3],
+        png: vec![1, 2, 3].into(),
         width: 1,
         height: 1,
     };

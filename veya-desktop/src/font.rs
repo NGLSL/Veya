@@ -3,6 +3,10 @@
 //! Windows 上 `msyh.ttc` 的族名是 `微软雅黑` / `Microsoft YaHei UI`，
 //! 系统消息字体却常常是 `Segoe UI`（无汉字）。若按「消息字体优先」就会
 //! 整界面豆腐块。这里白名单 CJK 字族，并 `set_sans_serif_family` 兜底。
+//!
+//! 保留完整系统字体数据库与原有语言、Emoji 回退；具体字面由 cosmic-text
+//! 按需加载并缓存。本地补丁仅在未启用 `monospace_fallback` 时跳过无用途的
+//! 等宽字面预热，不改变这里的字体选择与字体文件加载逻辑。
 
 use std::sync::OnceLock;
 

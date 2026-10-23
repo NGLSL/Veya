@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use image::{ImageDecoder, ImageFormat};
+use sha2::{Digest, Sha256};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -469,7 +470,11 @@ pub fn normalize_image(candidate: ClipboardImageRaw) -> Option<ClipboardPayload>
             (png, width, height)
         }
     };
-    Some(ClipboardPayload::Image { png, width, height })
+    Some(ClipboardPayload::Image {
+        png: png.into(),
+        width,
+        height,
+    })
 }
 
 /// ImageDecoder::read_image reads only the first GIF/WebP frame, without
@@ -670,17 +675,21 @@ pub fn dib_to_png(format: u32, bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
             return None;
         }
 
-        let file_offset = 14usize.checked_add(dib_pixel_offset)?;
-        let file_size = 14usize.checked_add(bytes.len())?;
-        let file_offset = u32::try_from(file_offset).ok()?;
-        let file_size = u32::try_from(file_size).ok()?;
-        let mut bmp = Vec::with_capacity(file_size as usize);
-        bmp.extend_from_slice(b"BM");
-        bmp.extend_from_slice(&file_size.to_le_bytes());
-        bmp.extend_from_slice(&[0; 4]);
-        bmp.extend_from_slice(&file_offset.to_le_bytes());
-        bmp.extend_from_slice(bytes);
-        image::load_from_memory_with_format(&bmp, ImageFormat::Bmp).ok()?
+        let file_offset = u32::try_from(14usize.checked_add(dib_pixel_offset)?).ok()?;
+        let file_size = u32::try_from(14usize.checked_add(bytes.len())?).ok()?;
+        let mut header = [0u8; 14];
+        header[..2].copy_from_slice(b"BM");
+        header[2..6].copy_from_slice(&file_size.to_le_bytes());
+        header[10..14].copy_from_slice(&file_offset.to_le_bytes());
+        // Keep the explicit pixel offset, including V5 bitfields, without
+        // copying the entire DIB to prepend the 14-byte BMP file header.
+        let reader = BmpDibReader {
+            header,
+            dib: bytes,
+            position: 0,
+        };
+        let decoder = image::codecs::bmp::BmpDecoder::new(std::io::BufReader::new(reader)).ok()?;
+        image::DynamicImage::from_decoder(decoder).ok()?
     };
 
     if decoded.width() != width || decoded.height() != height {
@@ -694,6 +703,42 @@ pub fn dib_to_png(format: u32, bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         return None;
     }
     Some((png, width, height))
+}
+
+/// Seekable BMP file view over a small file header and borrowed DIB bytes.
+struct BmpDibReader<'a> {
+    header: [u8; 14],
+    dib: &'a [u8],
+    position: u64,
+}
+
+impl std::io::Read for BmpDibReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let source = if self.position < 14 {
+            &self.header[self.position as usize..]
+        } else {
+            let offset = usize::try_from(self.position - 14).unwrap_or(usize::MAX);
+            self.dib.get(offset..).unwrap_or_default()
+        };
+        let length = source.len().min(output.len());
+        output[..length].copy_from_slice(&source[..length]);
+        self.position += length as u64;
+        Ok(length)
+    }
+}
+
+impl std::io::Seek for BmpDibReader<'_> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = match from {
+            std::io::SeekFrom::Start(position) => i128::from(position),
+            std::io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            std::io::SeekFrom::End(offset) => 14 + self.dib.len() as i128 + i128::from(offset),
+        };
+        self.position = u64::try_from(position).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid BMP seek")
+        })?;
+        Ok(self.position)
+    }
 }
 
 /// Re-copy a real clipboard payload. Files are always replayed as a copy;
@@ -713,19 +758,31 @@ pub fn write_payload(payload: &ClipboardPayload) -> Result<u32, ClipboardWriteEr
         }
         ClipboardPayload::Image { png, width, height } => {
             let dibv5 = encode_dibv5(png, *width, *height)?;
-            let dib = encode_legacy_dib(&dibv5, *width, *height)?;
             let png_format = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
             if png_format == 0 {
                 return Err("无法注册 PNG 剪贴板格式".into());
             }
-            write_global_payloads(&[(png_format, png), (CF_DIBV5, &dibv5), (CF_DIB, &dib)])
+            // Retain only the final Windows buffers and compact verification
+            // data. Finish every conversion before changing the clipboard.
+            let mut buffers = Vec::with_capacity(3);
+            let mut expected = Vec::with_capacity(3);
+            prepare_image_format(CF_DIBV5, &dibv5, &mut buffers, &mut expected)?;
+            let dib = encode_legacy_dib(&dibv5, *width, *height)?;
+            drop(dibv5);
+            prepare_image_format(CF_DIB, &dib, &mut buffers, &mut expected)?;
+            drop(dib);
+            prepare_image_format(png_format, png, &mut buffers, &mut expected)?;
+            // Preserve the original publication order: PNG, DIBV5, DIB.
+            buffers.rotate_right(1);
+            expected.rotate_right(1);
+            write_prepared_payloads(buffers, &expected)
         }
     }
 }
 
 /// Compatibility wrapper for existing text-only callers.
 pub fn write_unicode_text(text: &str) -> Option<u32> {
-    write_payload(&ClipboardPayload::Text(text.to_string())).ok()
+    write_payload(&ClipboardPayload::Text(text.to_string().into())).ok()
 }
 
 fn encode_hdrop(paths: &[String]) -> Result<Vec<u8>, String> {
@@ -813,10 +870,18 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
         .ok_or_else(|| "图片尺寸超出支持范围".to_string())?;
     let image_size = u32::try_from(pixel_bytes).map_err(|_| "图片数据超出支持大小".to_string())?;
 
-    // Reuse an RGBA decoder buffer, or finish converting other PNG color types
-    // before allocating the destination. A borrowed conversion clones RGBA.
-    let mut bgra = decoded.into_rgba8().into_raw();
-    let mut dib = vec![0u8; total];
+    // Reuse an RGBA decoder buffer, consuming other PNG color types when
+    // conversion is necessary. A borrowed conversion would clone RGBA.
+    let mut dib = decoded.into_rgba8().into_raw();
+    for pixel in dib.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    // Insert the small header into the owned decoder buffer instead of keeping
+    // a second full-sized destination alongside the decoded pixels.
+    dib.reserve_exact(124);
+    dib.resize(total, 0);
+    dib.copy_within(..pixel_bytes, 124);
+    dib[..124].fill(0);
     write_u32(&mut dib, 0, 124);
     write_i32(&mut dib, 4, width as i32);
     write_i32(&mut dib, 8, -(height as i32)); // top-down rows
@@ -831,10 +896,6 @@ fn encode_dibv5(png: &[u8], declared_width: u32, declared_height: u32) -> Result
     write_u32(&mut dib, 56, LCS_SRGB);
     write_u32(&mut dib, 108, LCS_GM_IMAGES);
 
-    for pixel in bgra.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    dib[124..].copy_from_slice(&bgra);
     Ok(dib)
 }
 
@@ -924,17 +985,67 @@ fn write_global_payloads(payloads: &[(u32, &[u8])]) -> Result<u32, ClipboardWrit
     {
         return Err("剪贴板数据超出支持大小".into());
     }
+    let buffers = payloads
+        .iter()
+        .map(|(_, bytes)| unsafe { ClipboardBuffer::new(bytes) })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected: Vec<_> = payloads
+        .iter()
+        .map(|(format, bytes)| (*format, ReplayContent::Bytes(bytes)))
+        .collect();
+    write_prepared_payloads(buffers, &expected)
+}
+
+enum ReplayContent<'a> {
+    Bytes(&'a [u8]),
+    Image { length: usize, digest: [u8; 32] },
+}
+
+impl ReplayContent<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Image { length, .. } => *length,
+        }
+    }
+
+    fn matches(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Bytes(expected) => replay_bytes_match(expected, bytes),
+            Self::Image { length, digest } => {
+                bytes.len() == *length && Sha256::digest(bytes).as_slice() == digest
+            }
+        }
+    }
+}
+
+fn prepare_image_format(
+    format: u32,
+    bytes: &[u8],
+    buffers: &mut Vec<ClipboardBuffer>,
+    expected: &mut Vec<(u32, ReplayContent<'static>)>,
+) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_DIB_BYTES {
+        return Err("剪贴板数据超出支持大小".to_string());
+    }
+    let content = ReplayContent::Image {
+        length: bytes.len(),
+        digest: Sha256::digest(bytes).into(),
+    };
+    buffers.push(unsafe { ClipboardBuffer::new(bytes)? });
+    expected.push((format, content));
+    Ok(())
+}
+
+fn write_prepared_payloads(
+    mut buffers: Vec<ClipboardBuffer>,
+    expected: &[(u32, ReplayContent<'_>)],
+) -> Result<u32, ClipboardWriteError> {
     let _access = CLIPBOARD_ACCESS
         .lock()
         .map_err(|_| "无法写入剪贴板：剪贴板访问锁已失效。".to_string())?;
     unsafe {
         let owner = clipboard_owner_hwnd().ok_or_else(|| "剪贴板窗口尚未启动".to_string())?;
-        // Prepare every format before clearing the current clipboard.
-        let mut buffers = payloads
-            .iter()
-            .map(|(_, bytes)| ClipboardBuffer::new(bytes))
-            .collect::<Result<Vec<_>, _>>()?;
-
         if let Err(error) = OpenClipboard(Some(owner)) {
             return Err(format!("无法打开剪贴板：{error}").into());
         }
@@ -945,7 +1056,7 @@ fn write_global_payloads(payloads: &[(u32, &[u8])]) -> Result<u32, ClipboardWrit
         // From here onward, this attempt has already changed the clipboard,
         // even if writing or read-only confirmation subsequently fails.
         let changed_result: Result<u32, String> = (|| {
-            for ((format, _), buffer) in payloads.iter().zip(&mut buffers) {
+            for ((format, _), buffer) in expected.iter().zip(&mut buffers) {
                 let hglobal = buffer.0.unwrap();
                 if let Err(error) = SetClipboardData(*format, Some(HANDLE(hglobal.0 as *mut _))) {
                     let _ = CloseClipboard();
@@ -963,11 +1074,11 @@ fn write_global_payloads(payloads: &[(u32, &[u8])]) -> Result<u32, ClipboardWrit
                 if GetClipboardOwner().unwrap_or_default() != owner {
                     return Err("剪贴板已变化，请重新选择。".to_string());
                 }
-                for (format, bytes) in payloads {
+                for (format, content) in expected {
                     let handle = GetClipboardData(*format)
                         .map_err(|error| format!("无法确认剪贴板内容，请重新选择：{error}"))?;
                     let current = HGLOBAL(handle.0);
-                    if GlobalSize(current) < bytes.len() {
+                    if GlobalSize(current) < content.len() {
                         return Err("剪贴板已变化，请重新选择。".to_string());
                     }
                     let pointer = GlobalLock(current);
@@ -977,8 +1088,8 @@ fn write_global_payloads(payloads: &[(u32, &[u8])]) -> Result<u32, ClipboardWrit
                     // Borrow only the payload range; GlobalAlloc may add trailing padding.
                     // The system owns this handle after SetClipboardData, so never free it.
                     let current_bytes =
-                        std::slice::from_raw_parts(pointer.cast::<u8>(), bytes.len());
-                    let matches = replay_bytes_match(bytes, current_bytes);
+                        std::slice::from_raw_parts(pointer.cast::<u8>(), content.len());
+                    let matches = content.matches(current_bytes);
                     let _ = GlobalUnlock(current);
                     if !matches {
                         return Err("剪贴板已变化，请重新选择。".to_string());
@@ -1040,7 +1151,7 @@ mod tests {
             write_global_payload(CF_UNICODETEXT, &[]).unwrap_err(),
             write_payload(&ClipboardPayload::Files(Vec::new())).unwrap_err(),
             write_payload(&ClipboardPayload::Image {
-                png: Vec::new(),
+                png: Vec::new().into(),
                 width: 1,
                 height: 1,
             })
@@ -1108,12 +1219,12 @@ mod tests {
         assert_eq!(round_trip, png);
         assert_eq!(
             veya_core::payload_hash(&ClipboardPayload::Image {
-                png: png.clone(),
+                png: png.clone().into(),
                 width,
                 height,
             }),
             veya_core::payload_hash(&ClipboardPayload::Image {
-                png: round_trip,
+                png: round_trip.into(),
                 width,
                 height,
             })
